@@ -38,11 +38,11 @@ jobs:
 
       - name: Install SPSDK
         run: |
-          python setup.py install
+          pip install -e .[all]
 
       - name: Run Codecheck
         run: |
-          python codecheck.py -s --output reports_codecheck --info-check gitcov
+          python codecheck.py -s --output reports_codecheck --info-check gitcov --info-check MYPY_TOOLS --info-check MYPY
 
       - name: Archive Results
         uses: actions/upload-artifact@v3
