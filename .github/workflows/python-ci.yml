@@ -39,7 +39,7 @@ jobs:
       - name:  Install Other Dependencies
         run:   |
           if [ "$RUNNER_OS" == "Linux" ]; then
-            apt install libpcsclite-dev
+            sudo apt-get update && sudo apt install -y libpcsclite-dev
           elif [ "$RUNNER_OS" == "Windows" ]; then
             echo "Windows"
           else
