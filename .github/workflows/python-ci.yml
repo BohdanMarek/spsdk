@@ -42,6 +42,8 @@ jobs:
             sudo apt-get update && sudo apt install -y libpcsclite-dev
           elif [ "$RUNNER_OS" == "Windows" ]; then
             echo "Windows"
+          elif [ "$RUNNER_OS" == "macOS" ]; then
+            echo "macOS"
           else
             echo "$RUNNER_OS not supported"
             exit 1
