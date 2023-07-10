@@ -39,16 +39,15 @@ jobs:
       - name:  Install Other Dependencies
         run:   |
           if [ "$RUNNER_OS" == "Linux" ]; then
-            sudo apt-get update && sudo apt install -y libpcsclite-dev
+            sudo apt-get update && sudo apt install -y libpcsclite-dev && sudo apt install -y swig
           elif [ "$RUNNER_OS" == "Windows" ]; then
-            echo "Windows"
+            choco install swig
           elif [ "$RUNNER_OS" == "macOS" ]; then
-            echo "macOS"
+            brew install swig
           else
             echo "$RUNNER_OS not supported"
             exit 1
           fi
-        shell: bash
 
       - name: Install SPSDK
         run: |
