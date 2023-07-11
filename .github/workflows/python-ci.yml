@@ -32,12 +32,6 @@ jobs:
           architecture: "x64"
 
       - name:  Install OS Dependencies
-        if: runner.os == 'Linux'
-        run:   |
-          sudo apt-get update && sudo apt install -y libpcsclite-dev
-        shell: bash
-
-      - name:  Install OS Dependencies
         run:   |
           if [ "$RUNNER_OS" == "Linux" ]; then
             sudo apt-get update && sudo apt install -y libpcsclite-dev
@@ -49,11 +43,11 @@ jobs:
 
       - name: Install SPSDK
         run: |
+          python -m pip install --upgrade pip
           pip install -e .[all]
 
       - name: Install Development Dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install -r requirements-develop.txt
  
       - name: Run Codecheck
