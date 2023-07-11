@@ -24,7 +24,7 @@ with open(os.path.join(base_dir, "spsdk", "__version__.py")) as f:
     exec(f.read(), version_info)
 
 extras_require = {
-    "tp": ["pyscard==2.0.2"],
+    "tp": ["swig", "pyscard==2.0.2"],
     "examples": ["flask", "requests", "ipython", "notebook"],
     "dk6": ["pyftdi", "pylibftdi", "ftd2xx"],
 }
