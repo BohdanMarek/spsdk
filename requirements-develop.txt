@@ -1,6 +1,5 @@
 # tox has to be installed first
 tox<4.7
--r requirements.txt
 # testing
 pytest<7.4
 pytest-cov<4.2

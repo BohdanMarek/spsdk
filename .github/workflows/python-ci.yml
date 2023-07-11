@@ -37,15 +37,25 @@ jobs:
           sudo apt-get update && sudo apt install -y libpcsclite-dev
         shell: bash
 
-      - name: Install Python Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements-develop.txt
- 
+      - name:  Install OS Dependencies
+        run:   |
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            sudo apt-get update && sudo apt install -y libpcsclite-dev
+          fi
+          if [ "$RUNNER_OS" == "macOS" ]; then
+            brew install pcsc-lite
+          fi
+        shell: bash
+
       - name: Install SPSDK
         run: |
           pip install -e .[all]
 
+      - name: Install Development Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-develop.txt
+ 
       - name: Run Codecheck
         run: |
           python codecheck.py -s --output reports_codecheck --info-check gitcov  --info-check MYPY_TOOLS --info-check MYPY
