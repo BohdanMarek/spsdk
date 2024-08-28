@@ -2,11 +2,17 @@
 
 name: Publish To PyPi
 
+#on:
+#  workflow_run:
+#    workflows: ["Python Continous Integration"]
+#    types:
+#      - completed
 on:
-  workflow_run:
-    workflows: ["Python Continous Integration"]
-    types:
-      - completed
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
+
 
 jobs:
   build:
