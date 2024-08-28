@@ -219,3 +219,6 @@ jyputer_notebook_checker = true
 [tool.clr]
 check_directories = ["spsdk", "tests", "tools", "examples"]
 excluded_files = ["spsdk/__version__.py"]
+
+[tool.check-wheel-contents]
+ignore = "W002"
