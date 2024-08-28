@@ -2,17 +2,10 @@
 
 name: Publish To PyPi
 
-#on:
-#  workflow_run:
-#    workflows: ["Python Continous Integration"]
-#    types:
-#      - completed
 on:
   push:
-    branches: ["master"]
-  pull_request:
-    branches: ["master"]
-
+    tags:
+      - 'v*' # Create release if a tag with version is pushed
 
 jobs:
   package:
