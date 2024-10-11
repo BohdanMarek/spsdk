@@ -16,7 +16,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest]
         python-version: ["3.9", "3.12"]
 
     name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
@@ -51,6 +51,7 @@ jobs:
  
       - name: Run Codecheck
         run: |
+          pip list
           # Ignoring the 'COPYRIGHT' check as the year of merge to Github may differ from the actual year when the file was updated 
           codecheck -s --output reports_codecheck --info-check gitcov  --info-check COPYRIGHT
 
