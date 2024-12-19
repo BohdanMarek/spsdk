@@ -60,8 +60,8 @@ jobs:
 
       - name: Set  TEMP environment variable
         run:   |
-          [System.Environment]::SetEnvironmentVariable('TEMP','c:\Temp', 'System')
-          [System.Environment]::SetEnvironmentVariable('TMP','c:\Temp', 'System')
+          [System.Environment]::SetEnvironmentVariable('TEMP','c:\Temp', 'Machine')
+          [System.Environment]::SetEnvironmentVariable('TMP','c:\Temp', 'Machine')
 
       - name:  Check cmake
         run:   |
