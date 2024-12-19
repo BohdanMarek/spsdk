@@ -47,20 +47,25 @@ jobs:
 
       - name:  Check cmake
         run:   |
-          cmake --version
-
-      - name: Check LongPathsEnabled
-        run: |
-         (Get-ItemProperty "HKLM:System\CurrentControlSet\Control\FileSystem").LongPathsEnabled
-
-      - name: Set LongPathsEnabled
-        run: |
-         Set-ItemProperty HKLM:System\CurrentControlSet\Control\FileSystem LongPathsEnabled 1
+          echo $env:TEMP
 
       - name: Set  TEMP environment variable
         run:   |
           echo "TEMP=c:\Temp" >> $GITHUB_ENV
           echo "TMP=c:\Temp" >> $GITHUB_ENV
+
+      - name:  Check cmake
+        run:   |
+          echo $env:TEMP
+
+      - name: Set  TEMP environment variable
+        run:   |
+          [System.Environment]::SetEnvironmentVariable('TEMP','c:\Temp', 'System')
+          [System.Environment]::SetEnvironmentVariable('TMP','c:\Temp', 'System')
+
+      - name:  Check cmake
+        run:   |
+          echo $env:TEMP
 
       - name: Install SPSDK
         run: |
