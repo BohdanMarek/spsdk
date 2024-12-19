@@ -48,7 +48,15 @@ jobs:
       - name:  Check cmake
         run:   |
           cmake --version
-          
+
+      - name: Check LongPathsEnabled
+        run: |
+         (Get-ItemProperty "HKLM:System\CurrentControlSet\Control\FileSystem").LongPathsEnabled
+
+      - name: Set LongPathsEnabled
+        run: |
+         Set-ItemProperty HKLM:System\CurrentControlSet\Control\FileSystem LongPathsEnabled 1
+
       - name: Set  TEMP environment variable
         run:   |
           echo "TEMP=c:\Temp" >> $GITHUB_ENV
