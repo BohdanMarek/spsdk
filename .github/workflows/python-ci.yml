@@ -48,6 +48,11 @@ jobs:
       - name:  Check cmake
         run:   |
           cmake --version
+          
+      - name: Set  TEMP environment variable
+        run:   |
+          echo "TEMP=c:\Temp" >> $GITHUB_ENV
+          echo "TMP=c:\Temp" >> $GITHUB_ENV
 
       - name: Install SPSDK
         run: |
