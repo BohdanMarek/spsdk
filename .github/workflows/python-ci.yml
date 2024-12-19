@@ -16,8 +16,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.9", "3.13"]
+        os: [windows-latest]
+        python-version: ["3.13"]
 
     name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
     steps:
@@ -39,6 +39,33 @@ jobs:
             brew install pcsc-lite swig
           fi
         shell: bash
+
+      - name: Setup cmake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.30.x'
+
+      - name:  Check cmake
+        run:   |
+          echo $env:TEMP
+
+      - name: Set  TEMP environment variable
+        run:   |
+          echo "TEMP=c:\Temp" >> $GITHUB_ENV
+          echo "TMP=c:\Temp" >> $GITHUB_ENV
+
+      - name:  Check cmake
+        run:   |
+          echo $env:TEMP
+
+      - name: Set  TEMP environment variable
+        run:   |
+          [System.Environment]::SetEnvironmentVariable('TEMP','c:\Temp', 'Machine')
+          [System.Environment]::SetEnvironmentVariable('TMP','c:\Temp', 'Machine')
+
+      - name:  Check cmake
+        run:   |
+          echo $env:TEMP
 
       - name: Install SPSDK
         run: |
