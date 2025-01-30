@@ -16,11 +16,23 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [windows-latest]
         python-version: ["3.9", "3.13"]
 
     name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
     steps:
+    #  - name: Enable Long Paths
+    #    run: |
+    #      reg add "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem" /v LongPathsEnabled /t REG_DWORD /d 1 /f
+
+    #  - name: Set Temp Directory
+    #    run: |
+    #      setx TEMP "C:\short-temp"
+    #      setx TMP "C:\short-temp"
+
+    #  - name: Configure CMake
+    #    run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+
       - uses: actions/checkout@v3
         with:
           fetch-depth: 0
