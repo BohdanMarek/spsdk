@@ -1,21 +1,23 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2024 NXP
+# Copyright 2024-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 """module that wraps libuuu library and provides a more user-friendly interface."""
 import logging
 import re
 from ctypes import CFUNCTYPE, POINTER, c_char_p, c_int, c_uint16, c_void_p
-from typing import Any, Callable, Optional
+from functools import wraps
+from typing import Any, Callable, Optional, no_type_check
 
 import click
 from libuuu import LibUUU, UUUNotifyCallback, UUUState
 from libuuu.libuuu import UUUNotifyStruct, UUUNotifyType, _default_notify_callback
 
-from spsdk.exceptions import SPSDKValueError
-from spsdk.utils.database import DatabaseManager, get_db, get_families
+from spsdk.exceptions import SPSDKError, SPSDKValueError
+from spsdk.utils.database import DatabaseManager, UsbId
+from spsdk.utils.family import FamilyRevision, get_db, get_families
 from spsdk.utils.misc import load_text
 
 logger = logging.getLogger(__name__)
@@ -58,6 +60,7 @@ class SPSDKUUUState(UUUState):
         :param progress_bar: show progress bar, defaults to True
         """
         self.progress_bar = progress_bar
+        self.status = 0
         super().__init__()
 
     def update_progress_bar(self, task_name: str, total_steps: int, step: int) -> None:
@@ -82,11 +85,14 @@ class SPSDKUUUState(UUUState):
         if step == total_steps:
             del self.progress_bars[task_name]
             click.echo("\r")
+            # Enable cursor again
+            click.echo("\033[?25h", nl=False)
 
     def update(self, struct: UUUNotifyStruct) -> None:
         """Update the state with a notification from uuu.
 
         :param struct: A UUUNotifyStruct object
+        :raises SPSDKError: If the command fails
         """
         self.waiting = struct.type == UUUNotifyType.NOTIFY_WAIT_FOR
         self.done = struct.type == UUUNotifyType.NOTIFY_DONE
@@ -98,12 +104,10 @@ class SPSDKUUUState(UUUState):
             self.cmd_pos = 0
             self.cmd_start = struct.timestamp
         elif struct.type == UUUNotifyType.NOTIFY_CMD_END:
-            status = struct.response.status
+            self.status = struct.response.status
             self.done = True
-            self.error = status != 0
+            self.error = self.status != 0
             self.cmd_end = struct.timestamp
-            if status != 0:
-                self.logger.error(f"Command {self.cmd} failed with error code {status}")
         elif struct.type == UUUNotifyType.NOTIFY_DEV_ATTACH:
             self.dev = struct.response.str
             self.done = False
@@ -116,7 +120,28 @@ class SPSDKUUUState(UUUState):
                 self.update_progress_bar(self.cmd, self.trans_size, self.trans_pos)
             self.logger.debug(f"Transfer {self.trans_pos}/{self.trans_size}")
 
-        self.logger.debug(f"{self.cmd=},{self.dev=},{self.waiting=}")
+        self.logger.debug(f"{self.cmd=},{self.dev=},{self.waiting=},{self.error=}")
+
+
+@no_type_check
+# pylint: disable=no-self-argument,missing-type-doc
+def check_uuu_error_state_after_command(f: Any):
+    """Decorator to wrap around functions which call libuuu."""
+
+    @wraps(f)
+    def inner(self: "SPSDKUUU", *args: Any, **kwargs: Any) -> int:
+        ret = f(self, *args, **kwargs)
+        if ret != 0 or self._state.error:
+            message = (
+                f"{f.__name__}: "
+                + ("Failed UUU command " + self._state.cmd if self._state.cmd else "")
+                + f" returned with exit code {ret}"
+                + f" and status {self._state.status}."
+            )
+            raise SPSDKError(message)
+        return ret
+
+    return inner
 
 
 class SPSDKUUU:
@@ -131,6 +156,8 @@ class SPSDKUUU:
         wait_next_timeout: int = 30,
         poll_period: int = 100,
         progress_bar: bool = True,
+        usb_path_filter: Optional[str] = None,
+        usb_serial_no_filter: Optional[str] = None,
     ) -> None:
         """Initialize the SPSDKUUU object.
 
@@ -138,6 +165,8 @@ class SPSDKUUU:
         :param wait_next_timeout: The timeout value for waiting for the next device in seconds, defaults to 30
         :param poll_period: The period in milliseconds for polling the USB device, defaults to 100
         :param progress_bar: True for showing the progress bar to stdout
+        :param usb_path_filter: The USB path to filter
+        :param usb_serial_no_filter: The USB serial number to filter
         """
         self.uuu = LibUUU()
         self.uuu.set_wait_timeout(wait_timeout)
@@ -145,6 +174,15 @@ class SPSDKUUU:
         self.uuu.set_poll_period(poll_period)
         self.uuu.unregister_notify_callback(_default_notify_callback)
         self.uuu.register_notify_callback(_spsdk_notify_callback, POINTER(c_void_p)())
+        rc = 0
+        logger.debug(f"Adding USB path filter: {usb_path_filter}")
+        rc = self.add_usbpath_filter(usb_path_filter) if usb_path_filter else 0
+        if rc != 0:
+            raise SPSDKValueError(f"Error adding USB path filter: {rc}")
+        logger.debug(f"Adding USB serial number filter: {usb_serial_no_filter}")
+        rc = self.add_usbserial_no_filter(usb_serial_no_filter) if usb_serial_no_filter else 0
+        if rc != 0:
+            raise SPSDKValueError(f"Error adding USB serial number filter: {rc}")
         self._state.progress_bar = progress_bar
 
     @property
@@ -163,7 +201,7 @@ class SPSDKUUU:
         return self.uuu.get_last_error()
 
     @staticmethod
-    def get_supported_families() -> list[str]:
+    def get_supported_families() -> list[FamilyRevision]:
         """Get the list of supported families.
 
         :return: List of family names that support memory configuration.
@@ -179,7 +217,68 @@ class SPSDKUUU:
             .keys()
         )
 
-    def get_uuu_script(self, boot_device: str, family: str, args: Optional[list[str]]) -> str:
+    @classmethod
+    def get_usb_ids(cls) -> dict[str, list[UsbId]]:
+        """Get list of all supported devices from the database.
+
+        :return: Dictionary containing device names with their usb configurations
+        """
+        devices = {}
+        for device, quick_info in DatabaseManager().quick_info.devices.devices.items():
+            usb_ids = quick_info.info.isp.get_usb_ids("sdps")
+            if usb_ids:
+                devices[device] = usb_ids
+        return devices
+
+    @staticmethod
+    def replace_arguments(
+        input_string: str, arguments_dict: dict[str, dict[str, Any]], arguments: list[str]
+    ) -> str:
+        """Replace arguments in the input string.
+
+        :param input_string: The input string to replace arguments in.
+        :param arguments_dict: A dictionary containing the arguments and their descriptions.
+        :param arguments: The list of arguments to replace in the input string.
+        :return: The input string with the arguments replaced.
+        """
+        # Normalize arguments by replacing backslashes with forward slashes
+        normalized_arguments = [arg.replace("\\", "/") for arg in arguments]
+
+        # Create a mapping of argument keys to their replacements
+        argument_mapping = {
+            key: normalized_arguments[i]
+            for i, key in enumerate(arguments_dict.keys())
+            if i < len(normalized_arguments)
+        }
+
+        # Create a list of tuples (key, replacement) to avoid modifying the input_string while iterating
+        replacements = []
+
+        for key, val in arguments_dict.items():
+            if key in input_string:
+                if key in argument_mapping:
+                    replacement = argument_mapping[key]
+                    # Check for .ZST or .BZ2 extension and modify the replacement string
+                    if replacement.upper().endswith(".ZST") or replacement.upper().endswith(".BZ2"):
+                        if replacement.endswith('"'):
+                            replacement = replacement[:-1] + '/*"'
+                        else:
+                            replacement += "/*"
+                    replacements.append((key, replacement))
+                elif val["optional_key"] and val["optional_key"] in argument_mapping:
+                    replacements.append((key, argument_mapping[val["optional_key"]]))
+                else:
+                    replacements.append((key, val["optional_key"] if val["optional_key"] else ""))
+
+        # Perform replacements in the input_string using regular expressions to match whole words
+        for key, replacement in replacements:
+            input_string = re.sub(r"\b" + re.escape(key) + r"\b", replacement, input_string)
+
+        return input_string
+
+    def get_uuu_script(
+        self, boot_device: str, family: FamilyRevision, args: Optional[list[str]]
+    ) -> str:
         """Get the uuu script for the given boot device."""
         script_path = get_db(family).get_file_path(
             DatabaseManager.NXPUUU, ["boot_devices", boot_device, "script"]
@@ -208,32 +307,8 @@ class SPSDKUUU:
             description = match[3].strip()
             arguments_dict[key] = {"description": description, "optional_key": optional_key}
 
-        def replace_arguments(
-            input_string: str, arguments_dict: dict[Any, dict[str, Any]], arguments: list[str]
-        ) -> str:
-            """Replace arguments in the input string.
-
-            :param input_string: The input string to replace arguments in.
-            :param arguments_dict: A dictionary containing the arguments and their descriptions.
-            :param arguments: The list of arguments to replace in the input string.
-            :return: The input string with the arguments replaced.
-            """
-            for key, val in arguments_dict.items():
-                if key in input_string:
-                    if len(arguments) > list(arguments_dict.keys()).index(key):
-                        input_string = input_string.replace(
-                            key, arguments[list(arguments_dict.keys()).index(key)]
-                        )
-                    else:
-                        optional_key_index = list(arguments_dict.keys()).index(val["optional_key"])
-                        if optional_key_index < len(arguments):
-                            input_string = input_string.replace(key, arguments[optional_key_index])
-                        else:
-                            input_string = input_string.replace(key, val["optional_key"])
-            return input_string
-
         try:
-            script = replace_arguments(script, arguments_dict, args)
+            script = SPSDKUUU.replace_arguments(script, arguments_dict, args)
         except ValueError as e:
             raise SPSDKValueError(
                 f"Invalid arguments passed, you should pass {argument_names}"
@@ -250,10 +325,20 @@ class SPSDKUUU:
         logger.info(f"{command} {success=} response={self.response}")
         return success
 
+    def run_uboot_acmd(self, command: str) -> bool:
+        """Run uboot command ACMD.
+
+        :param command: string command
+        """
+        success = self.uuu.run_cmd(f"FB:ACMD {command}", 0) == 0
+        logger.info(f"{command} {success=} response={self.response}")
+        return success
+
     def enable_fastboot_output(self) -> bool:
         """Enable fastboot output for stdout and stderr of uboot commands."""
         return self.run_uboot("setenv stdout serial,fastboot")
 
+    @check_uuu_error_state_after_command
     def run_cmd(self, cmd: str, dry: bool = False) -> int:
         """Run a uuu command.
 
@@ -263,6 +348,7 @@ class SPSDKUUU:
         """
         return self.uuu.run_cmd(cmd, dry)
 
+    @check_uuu_error_state_after_command
     def run_script(self, script_path: str, dry: bool = False) -> int:
         """Run a uuu script.
 
@@ -282,6 +368,7 @@ class SPSDKUUU:
         self.uuu._response.value = b""
         return self.uuu.lib.uuu_auto_detect_file(c_char_p(str.encode(filename)))
 
+    @check_uuu_error_state_after_command
     def wait_uuu_finish(
         self,
         daemon: bool = False,
@@ -302,3 +389,19 @@ class SPSDKUUU:
         :return: The result of the execution.
         """
         return self.uuu.lib.uuu_for_each_devices(UUULsUsbDevices(callback))
+
+    def add_usbpath_filter(self, path: str) -> int:
+        """Add a USB path filter.
+
+        :param path: The USB path to filter.
+        :return: The result of adding the filter.
+        """
+        return self.uuu.lib.uuu_add_usbpath_filter(c_char_p(str.encode(path)))
+
+    def add_usbserial_no_filter(self, serial_no: str) -> int:
+        """Add a USB serial number filter.
+
+        :param serial_no: The USB serial number to filter.
+        :return: The result of adding the filter.
+        """
+        return self.uuu.lib.uuu_add_usbserial_no_filter(c_char_p(str.encode(serial_no)))

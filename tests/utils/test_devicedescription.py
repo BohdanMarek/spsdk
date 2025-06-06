@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2021-2024 NXP
+# Copyright 2021-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -88,6 +88,7 @@ def test_repr():
                 "mcxc244",
                 "mcxc443",
                 "mcxc444",
+                "mcxe247",
                 "mimxrt1010",
                 "mimxrt1015",
                 "mimxrt1020",
@@ -141,6 +142,7 @@ def test_get_device_name2(vid, pid, expected_result):
                 "mcxc244",
                 "mcxc443",
                 "mcxc444",
+                "mcxe247",
                 "mimxrt1010",
                 "mimxrt1015",
                 "mimxrt1020",

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2020-2024 NXP
+# Copyright 2020-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -30,7 +30,7 @@ from spsdk.utils.misc import (
     load_binary,
     load_file,
     load_secret,
-    reverse_bits_in_bytes,
+    reverse_bits,
     reverse_bytes_in_longs,
     size_fmt,
     swap16,
@@ -148,7 +148,7 @@ def test_align_block_invalid_input():
         # align to 4
         (b"\x00\x01\x02\x03", 4, 0, b"\x00\x01\x02\x03"),
         (b"\x00\x01\x02", 4, 0, b"\x00\x01\x02\x00"),
-        (b"\x00\x01", 4, 255, b"\x00\x01\xFF\xFF"),
+        (b"\x00\x01", 4, 255, b"\x00\x01\xff\xff"),
     ],
 )
 def test_add_padding(test_input: bytes, length: int, padding: int, expected: bytes) -> None:
@@ -260,19 +260,6 @@ def test_find_file_invalid(data_dir):
 )
 def test_format_value(value, size, expected):
     assert format_value(value, size) == expected
-
-
-@pytest.mark.parametrize(
-    "value,expected",
-    [
-        (b"\xa5", b"\xa5"),
-        (b"\x00", b"\x00"),
-        (b"\x12\x34", b"\x48\x2c"),
-        (b"", b""),
-    ],
-)
-def test_reverse_bits_in_bytes(value, expected):
-    assert reverse_bits_in_bytes(value) == expected
 
 
 def test_reg_long_reverse():
@@ -430,7 +417,7 @@ def test_value_to_bool(value, res, exc):
 
 def test_timeout_basic():
     """Basic test of timeout."""
-    timeout = Timeout(100, "ms")
+    timeout = Timeout(50, "ms")
     assert not timeout.overflow()
     time.sleep(0.1)
     with pytest.raises(SPSDKTimeoutError):
@@ -477,6 +464,19 @@ def test_size_format(input_value, use_kibibyte, expected):
 def test_swap16_invalid():
     with pytest.raises(SPSDKError, match="Incorrect number to be swapped"):
         swap16(0xFFFFA)
+
+
+@pytest.mark.parametrize(
+    "input_value, bits_cnt, expected",
+    [
+        (0, 32, 0),
+        (1, 8, 0b10000000),
+        (0x12345678, 32, 0x1E6A2C48),
+        (1, 64, 1 << 63),
+    ],
+)
+def test_reverse_bits(input_value, bits_cnt, expected):
+    assert reverse_bits(input_value, bits_cnt) == expected
 
 
 def test_load_secret(data_dir):

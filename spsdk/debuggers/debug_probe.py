@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2020-2024 NXP
+# Copyright 2020-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 """Module for DebugMailbox Debug probes support."""
@@ -17,6 +17,7 @@ import prettytable
 
 from spsdk.exceptions import SPSDKError, SPSDKValueError
 from spsdk.utils.exceptions import SPSDKTimeoutError
+from spsdk.utils.family import FamilyRevision
 from spsdk.utils.misc import Timeout, value_to_int
 
 logger = logging.getLogger(__name__)
@@ -58,9 +59,11 @@ class DebugProbe(ABC):
     APSEL_SHIFT = 24
     APSEL_APBANKSEL = APSEL | APBANKSEL
 
-    DP_ABORT_REG = 0x00
+    DP_IDR_REG = 0x00  # Read access
+    DP_ABORT_REG = 0x00  # Write Access
     DP_CTRL_STAT_REG = 0x04
-    IDR_REG = 0xFC
+
+    AP_IDR_REG = 0xFC
 
     CSYSPWRUPACK = 0x80 << 24
     CSYSPWRUPREQ = 0x40 << 24
@@ -86,6 +89,11 @@ class DebugProbe(ABC):
         """
         self.hardware_id = hardware_id
         self.options = options or {}
+        self.family = None
+        family = self.options.pop("family", None)
+        revision = self.options.pop("revision", None)
+        if family:
+            self.family = FamilyRevision(family, revision)
         self.mem_ap_ix = -1
 
     @classmethod
@@ -238,6 +246,10 @@ class DebugProbe(ABC):
         sleep(self.AFTER_RESET_TIME)
 
     @abstractmethod
+    def read_dp_idr(self) -> int:
+        """Read Debug port identification register."""
+
+    @abstractmethod
     def debug_halt(self) -> None:
         """Halt the CPU execution."""
 
@@ -320,7 +332,9 @@ class DebugProbeCoreSightOnly(DebugProbe):
                     try:
                         idr = self.coresight_reg_read(
                             access_port=True,
-                            addr=self.get_coresight_ap_address(access_port=i, address=self.IDR_REG),
+                            addr=self.get_coresight_ap_address(
+                                access_port=i, address=self.AP_IDR_REG
+                            ),
                         )
                         # Extract IDR fields used for lookup. TODO solve that
                         ap_class = (idr & 0x1E000) >> 13
@@ -694,6 +708,10 @@ class DebugProbeCoreSightOnly(DebugProbe):
                 f"Bank: {hex((self.last_accessed_ap & self.APBANKSEL) >> self.APBANK_SHIFT)}"
             )
 
+    def read_dp_idr(self) -> int:
+        """Read Debug port identification register."""
+        return self.coresight_reg_read(access_port=False, addr=self.DP_IDR_REG)
+
     @get_mem_ap
     def debug_halt(self) -> None:
         """Halt the CPU execution."""
@@ -727,10 +745,6 @@ class DebugProbeCoreSightOnly(DebugProbe):
             self.close()
         except NotImplementedError:
             pass
-
-
-# for backward compatibility
-DebugProbeLocal = DebugProbeCoreSightOnly
 
 
 class ProbeDescription:
@@ -767,6 +781,9 @@ class ProbeDescription:
         """Provide string representation of debug probe."""
         return f"Debug probe: {self.interface}; {self.description}. S/N:{self.hardware_id}"
 
+    def __repr__(self) -> str:
+        return f"Debug probe: {self.interface}"
+
 
 class DebugProbes(list[ProbeDescription]):
     """Helper class for debug probe selection. This class accepts only ProbeDescription object."""
@@ -777,8 +794,8 @@ class DebugProbes(list[ProbeDescription]):
         table.align = "l"
         table.header = True
         table.border = True
-        table.hrules = prettytable.HEADER
-        table.vrules = prettytable.NONE
+        table.hrules = prettytable.HRuleStyle.HEADER
+        table.vrules = prettytable.VRuleStyle.NONE
         i = 0
         for probe in self:
             table.add_row(

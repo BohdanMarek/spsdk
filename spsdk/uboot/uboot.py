@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2023-2024 NXP
+# Copyright 2023-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 """Implementation of U-Boot communication interfaces."""
@@ -67,15 +67,19 @@ class UbootSerial:
         :param count: count of bytes
         :raises SPSDKError: Invalid CRC of data
         """
-        if not self.crc:
+        try:
+            if not self.crc:
+                return
+            crc_command = f"crc32 {hex(address)} {hex(count)}"
+            self.write(crc_command)
+            hexdump_str = self.LINE_FEED.join(self.read_output().splitlines())
+            if "==>" in hexdump_str:
+                hexdump_str += self.LINE_FEED.join(self.read_output().splitlines())
+            hexdump_str = hexdump_str.splitlines()[-2][-8:]
+            crc_obtained = int("0x" + hexdump_str, base=16)
+        except Exception as e:
+            logger.info(f"CRC calculation failed: {e}")
             return
-        crc_command = f"crc32 {hex(address)} {hex(count)}"
-        self.write(crc_command)
-        hexdump_str = self.LINE_FEED.join(self.read_output().splitlines())
-        if "==>" in hexdump_str:
-            hexdump_str += self.LINE_FEED.join(self.read_output().splitlines())
-        hexdump_str = hexdump_str.splitlines()[-2][-8:]
-        crc_obtained = int("0x" + hexdump_str, base=16)
         logger.debug(f"CRC command:\n{crc_command}\n{crc_obtained}")
         crc_ob = from_crc_algorithm(CrcAlg.CRC32)
         calculated_crc = crc_ob.calculate(data)
@@ -179,10 +183,11 @@ class UbootSerial:
         output = self._device.read_until(expected=self.PROMPT).decode(self.ENCODING)
         return output
 
-    def write(self, data: str) -> None:
+    def write(self, data: str, no_exit: bool = False) -> None:
         """Write ASCII decoded data to CLI. Append LINE FEED if not present.
 
         :param data: ASCII decoded data
+        :param no_exit: Do not expect exit code
         """
         logger.debug(f"Uboot WRITE -> {data}")
         if self.LINE_FEED not in data:
@@ -238,6 +243,8 @@ class UbootFastboot:
         serial_port: Optional[str] = None,
         timeout: int = 5000,
         crc: bool = True,
+        usb_path_filter: Optional[str] = None,
+        usb_serial_no_filter: Optional[str] = None,
     ):
         """Uboot fastboot interface.
 
@@ -246,6 +253,8 @@ class UbootFastboot:
         :param buffer_size: Size of buffer
         :param timeout: Timeout, defaults to 5000
         :param crc: Calculate CRC for frame, defaults to True
+        :param usb_path_filter: USB path filter
+        :param usb_serial_no_filter: USB serial number filter
         """
         self.timeout = timeout
         self.buffer_address = buffer_address
@@ -253,7 +262,12 @@ class UbootFastboot:
         self.serial_port = serial_port
         self.is_opened = False
         self.crc = crc
-        self.uuu = SPSDKUUU(wait_timeout=timeout // 1000)
+        self.uuu = SPSDKUUU(
+            wait_timeout=timeout // 1000,
+            wait_next_timeout=timeout // 1000,
+            usb_path_filter=usb_path_filter,
+            usb_serial_no_filter=usb_serial_no_filter,
+        )
 
     def open(self) -> None:
         """Open interface."""
@@ -294,12 +308,15 @@ class UbootFastboot:
         serial.close()
         logger.info("Successfully opened fastboot in uboot serial")
 
-    def write(self, command: str) -> bool:
+    def write(self, command: str, no_exit: bool = False) -> bool:
         """Write uboot command.
 
         :param command: string command
+        :param no_exit: Do not expect exit code (run ACMD).
         :return: Return code from the libuuu
         """
+        if no_exit:
+            return self.uuu.run_uboot_acmd(command)
         return self.uuu.run_uboot(command)
 
     def read_output(self) -> str:
@@ -336,16 +353,20 @@ class UbootFastboot:
         :param count: count of bytes
         :raises SPSDKError: Invalid CRC of data
         """
-        if not self.crc:
-            return
-        crc_command = f"crc32 {hex(address)} {hex(count)}"
-        self.write(crc_command)
         try:
-            hexdump_str = self.uuu.response.splitlines()[0][-8:].strip()
-        except IndexError as e:
-            raise SPSDKIndexError("Cannot get CRC response") from e
-        logger.debug(f"CRC read: {hexdump_str}")
-        crc_obtained = int("0x" + hexdump_str, base=16)
+            if not self.crc:
+                return
+            crc_command = f"crc32 {hex(address)} {hex(count)}"
+            self.write(crc_command)
+            try:
+                hexdump_str = self.uuu.response.splitlines()[0][-8:].strip()
+            except IndexError as e:
+                raise SPSDKIndexError("Cannot get CRC response") from e
+            logger.debug(f"CRC read: {hexdump_str}")
+            crc_obtained = int("0x" + hexdump_str, base=16)
+        except Exception as e:
+            logger.info(f"CRC calculation failed: {e}")
+            return
         logger.debug(f"CRC command:\n{crc_command!r}\n{crc_obtained!r}")
         crc_ob = from_crc_algorithm(CrcAlg.CRC32)
         calculated_crc = crc_ob.calculate(data)

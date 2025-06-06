@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2023-2024 NXP
+# Copyright 2023-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -15,7 +15,7 @@ import shlex
 import sys
 import time
 from datetime import datetime, timedelta
-from typing import Optional, Union
+from typing import Optional
 
 import click
 
@@ -34,7 +34,10 @@ from spsdk.el2go.bulk import ServiceDB
 from spsdk.el2go.database import SecureObjectsDB
 from spsdk.el2go.interface import EL2GOInterfaceHandler
 from spsdk.el2go.secure_objects import SecureObjects
-from spsdk.utils.misc import load_binary, load_configuration, load_text, write_file
+from spsdk.fuses.fuses import Fuses
+from spsdk.utils.config import Config
+from spsdk.utils.family import FamilyRevision
+from spsdk.utils.misc import get_printable_path, load_binary, load_text, write_file
 
 # use the same set of interfaces for all commands
 el2go_fw_interface = spsdk_el2go_interface(sdio=False, can=False, plugin=False)
@@ -97,7 +100,7 @@ def get_version_command(interface: EL2GOInterfaceHandler) -> None:
 )
 def prepare_device_command(
     interface: EL2GOInterfaceHandler,
-    config: str,
+    config: Config,
     secure_objects_file: str,
     database: str,
     remote_database: str,
@@ -115,9 +118,10 @@ def prepare_device_command(
 
     Please note that the memory for Secure Objects and TP FW has to be configured.
     """
+    client = EL2GOTPClient.load_from_config(config)
     prepare_device(
         interface=interface,
-        config=config,
+        client=client,
         secure_objects_file=secure_objects_file,
         database=database,
         remote_database=remote_database,
@@ -127,14 +131,13 @@ def prepare_device_command(
 
 def prepare_device(
     interface: EL2GOInterfaceHandler,
-    config: str,
+    client: EL2GOTPClient,
     secure_objects_file: Optional[str] = None,
     database: Optional[str] = None,
     remote_database: Optional[str] = None,
     clean: bool = False,
 ) -> None:
     """Prepare device for Trust Provisioning."""
-    client = _create_client(config)
     interface.prepare(client.loader)
     prov_data = _retrieve_secure_objects(
         interface=interface,
@@ -158,7 +161,7 @@ def prepare_device(
 )
 def run_provisioning_command(
     interface: EL2GOInterfaceHandler,
-    config: str,
+    config: Config,
     dry_run: bool,
 ) -> None:
     """Launch EdgeLock 2GO NXP Provisioning Firmware.
@@ -169,7 +172,7 @@ def run_provisioning_command(
     and correct setup will be verified.
 
     """
-    client = _create_client(config)
+    client = EL2GOTPClient.load_from_config(config)
 
     interface.run_provisioning(
         tp_data_address=client.tp_data_address,
@@ -180,7 +183,7 @@ def run_provisioning_command(
 
 
 @main.command(name="get-secure-objects", no_args_is_help=True)
-@el2go_optional_fw_interface  # TODO: This might be optional
+@el2go_optional_fw_interface
 @spsdk_config_option()
 @click.option(
     "-e",
@@ -225,7 +228,7 @@ def run_provisioning_command(
     ),
 )
 def get_secure_objects_command(
-    config: str,
+    config: Config,
     interface: EL2GOInterfaceHandler,
     output: str,
     encoding: str,
@@ -254,7 +257,7 @@ def get_secure_objects_command(
 
 
 def get_secure_objects(
-    config: str,
+    config: Config,
     interface: Optional[EL2GOInterfaceHandler] = None,
     output: Optional[str] = None,
     encoding: str = "bin",
@@ -265,7 +268,7 @@ def get_secure_objects(
     continue_on_error: bool = False,
 ) -> None:
     """Download EdgeLock 2GO Secure objects generated for the device attached."""
-    client = _create_client(config)
+    client = EL2GOTPClient.load_from_config(config)
 
     if database or remote_database:
         db = SecureObjectsDB.create(file_path=database, host=remote_database)
@@ -383,7 +386,7 @@ def get_uuid(interface: EL2GOInterfaceHandler, database: str, remote_database: s
 )
 def provision_objects_commands(
     interface: EL2GOInterfaceHandler,
-    config: str,
+    config: Config,
     secure_objects_file: str,
     database: str,
     remote_database: str,
@@ -404,7 +407,7 @@ def provision_objects_commands(
 
 def provision_objects(
     interface: EL2GOInterfaceHandler,
-    config: str,
+    config: Config,
     secure_objects_file: Optional[str] = None,
     database: Optional[str] = None,
     remote_database: Optional[str] = None,
@@ -412,11 +415,11 @@ def provision_objects(
     dry_run: bool = False,
 ) -> None:
     """Provision the device with Secure Object blob downloaded from EL2GO via `get-secure-objects` command."""
-    client = _create_client(config)
+    client = EL2GOTPClient.load_from_config(config_data=config)
 
     prepare_device(
         interface=interface,
-        config=config,
+        client=client,
         secure_objects_file=secure_objects_file,
         database=database,
         remote_database=remote_database,
@@ -457,7 +460,7 @@ def provision_objects(
 )
 def provision_device_command(
     interface: EL2GOInterfaceHandler,
-    config: str,
+    config: Config,
     workspace: str,
     re_assign: bool,
     clean: bool,
@@ -484,7 +487,7 @@ def provision_device_command(
 
 def provision_device(
     interface: EL2GOInterfaceHandler,
-    config: str,
+    config: Config,
     workspace: Optional[str] = None,
     re_assign: bool = False,
     clean: bool = False,
@@ -494,7 +497,7 @@ def provision_device(
     if workspace:
         os.makedirs(workspace, exist_ok=True)
 
-    client = _create_client(config)
+    client = EL2GOTPClient.load_from_config(config_data=config)
     uuid = interface.get_uuid()
     if workspace:
         write_file(uuid, os.path.join(workspace, "uuid.txt"), mode="w")
@@ -521,12 +524,6 @@ def provision_device(
         prov_fw=client.prov_fw,
         dry_run=dry_run,
     )
-
-
-def _create_client(config: str) -> EL2GOTPClient:
-    config_data = load_configuration(path=config)
-    search_path = os.path.dirname(config)
-    return EL2GOTPClient.from_config(config_data=config_data, search_paths=[search_path])
 
 
 def _retrieve_secure_objects(
@@ -587,9 +584,37 @@ def _upload_data(
         click.echo(f"Writing Secure Objects to MMC/SD FAT: {hex(user_data_address)}")
         interface.write_memory(address=user_data_address, data=secure_objects)
         output = interface.send_command(
-            f"fatwrite mmc 0:1 {user_data_address:x} secure_objects.bin {len(secure_objects):x}"
+            f"fatwrite {client.fatwrite_interface} {client.fatwrite_device_partition}"
+            + f" {user_data_address:x} {client.fatwrite_filename} {len(secure_objects):x}"
         )
         click.echo(f"Data written {output}")
+        if client.oem_provisioning_config_filename:
+            interface.write_memory(
+                address=user_data_address, data=client.oem_provisioning_config_bin
+            )
+            # Write also OEM APP config if provided
+            click.echo(
+                f"Writing OEM Provisioning Config to MMC/SD FAT: {client.oem_provisioning_config_filename}"
+            )
+
+            output = interface.send_command(
+                f"fatwrite {client.fatwrite_interface} {client.fatwrite_device_partition}"
+                + f" {user_data_address:x} {client.oem_provisioning_config_filename} "
+                + f"{len(client.oem_provisioning_config_bin):x}"
+            )
+
+        click.echo(f"Data written {output}")
+
+        if client.boot_linux:
+            click.echo("Booting Linux")
+
+            for command in client.linux_boot_sequence:
+                # in case of last command set no_exit to true
+                if command == client.linux_boot_sequence[-1]:
+                    output = interface.send_command(command, no_exit=True)
+                else:
+                    output = interface.send_command(command)
+                click.echo(f"  Command: {command} -> {output}")
 
     elif client.use_user_config:
         click.echo(f"Writing User config data to: {hex(fw_read_address)}")
@@ -616,63 +641,44 @@ def _upload_data(
 @main.command(name="get-template", no_args_is_help=True)
 @spsdk_family_option(families=EL2GOTPClient.get_supported_families())
 @spsdk_output_option(force=True)
-def get_template_command(family: str, output: str) -> None:
+def get_template_command(family: FamilyRevision, output: str) -> None:
     """Get template for the configuration file used in other command."""
     get_template(family=family, output=output)
 
 
-def get_template(family: str, output: str) -> None:
+def get_template(family: FamilyRevision, output: str) -> None:
     """Get template for the configuration file used in other command."""
-    yaml_data = EL2GOTPClient.generate_config_template(family=family)
+    yaml_data = EL2GOTPClient.get_config_template(family=family)
     write_file(data=yaml_data, path=output)
-    click.echo(f"The EL2GO template for {family} has been saved into {output} YAML file")
+    click.echo(
+        f"The EL2GO template for {family} has been saved into {get_printable_path(output)} YAML file"
+    )
 
 
 @main.command(name="test-connection", no_args_is_help=True)
 @spsdk_config_option()
-def test_connection_command(config: str) -> None:
+def test_connection_command(config: Config) -> None:
     """Test connection with EdgeLock 2GO."""
     test_connection(config=config)
 
 
-def test_connection(config: str) -> None:
+def test_connection(config: Config) -> None:
     """Test connection with EdgeLock 2GO."""
-    config_data = load_configuration(path=config)
-    search_path = os.path.dirname(config)
-    client = EL2GOTPClient.from_config(config_data=config_data, search_paths=[search_path])
-
-    client.test_connection()
+    EL2GOTPClient.load_from_config(config).test_connection()
     click.echo("12NC and Device Group tested successfully")
 
 
 @main.command(name="get-otp-binary", no_args_is_help=True)
-@spsdk_family_option(
-    families=EL2GOTPClient.get_supported_families(),
-    required=False,
-    help="Required only when using SEC Tool's JSON config file.",
-)
-@spsdk_config_option()
+@spsdk_config_option(klass=Fuses)
 @spsdk_output_option(force=True)
-def get_otp_binary_command(config: str, output: str, family: str) -> None:
+def get_otp_binary_command(config: Config, output: str) -> None:
     """Generate EL2GO OTP Binary from data in configuration file."""
-    get_otp_binary(config=config, output=output, family=family)
+    get_otp_binary(config=config, output=output)
 
 
-def get_otp_binary(config: str, output: str, family: Optional[str] = None) -> None:
+def get_otp_binary(config: Config, output: str) -> None:
     """Generate EL2GO OTP Binary from data in configuration file."""
-    config_data: Optional[Union[list, dict]] = None
-    try:
-        config_data = load_configuration(path=config)
-    except SPSDKError:
-        try:
-            with open(config, "r") as f:
-                config_data = json.load(f)
-        except json.JSONDecodeError:
-            pass
-    if not config_data:
-        raise SPSDKAppError("Invalid configuration file format")
-
-    data = get_el2go_otp_binary(config_data=config_data, family=family)
+    data = get_el2go_otp_binary(config)
     write_file(data=data, path=output, mode="wb")
     click.echo(f"EL2GO OTP Binary stored into {output}")
 
@@ -724,7 +730,7 @@ def combine_uuid_db(output: str, input_sources: list[str]) -> None:
     click.echo(f"UUID databases combined into {output}")
 
 
-@main.command(name="parse-uuid-db")
+@main.command(name="parse-uuid-db", no_args_is_help=True)
 @click.option(
     "-i",
     "--input",
@@ -770,12 +776,12 @@ def parse_uuid_db(output: str, input_db: str) -> None:
     type=click.Path(exists=True, dir_okay=False),
     help="Unclaim devices only in this database",
 )
-def unclaim(config: str, database: str) -> None:
+def unclaim(config: Config, database: str) -> None:
     """Unclaim devices: Remove UUIDs from Device Group.
 
     If a database is specified, unclaim only UUIDs in database and remove Secure Objects from database.
     """
-    client = _create_client(config=config)
+    client = EL2GOTPClient.load_from_config(config)
     click.echo(f"Loading UUIDs registered in Device Group: {client.device_group_id}")
     remote_uuids = client.get_uuids()
     click.echo(f"Found {len(remote_uuids)} UUIDs")
@@ -838,7 +844,7 @@ def unclaim(config: str, database: str) -> None:
     help="Max chunk size for one job (default: 500)",
 )
 def bulk_so_download_command(
-    config: str, database: str, limit: int, time_per_device: float, max_job_size: int
+    config: Config, database: str, limit: int, time_per_device: float, max_job_size: int
 ) -> None:
     """Download Secure Objects for all UUIDs in the database."""
     bulk_so_download(
@@ -851,14 +857,14 @@ def bulk_so_download_command(
 
 
 def bulk_so_download(
-    config: str, database: str, limit: int, time_per_device: float, max_job_size: int
+    config: Config, database: str, limit: int, time_per_device: float, max_job_size: int
 ) -> None:
     """Download Secure Objects for all UUIDs in the database.
 
     Note: This command is only in alpha stage and may not work as expected.
     In case of any problems, please contact the SPSDK team.
     """
-    client = _create_client(config)
+    client = EL2GOTPClient.load_from_config(config)
     db = ServiceDB(file_path=database)
 
     # get UUIDs from the database
@@ -875,9 +881,10 @@ def bulk_so_download(
     def _submit_new_jobs(jobs: list[list[str]]) -> None:
         with db:
             for group_uuids in jobs:
-                job_id = client.register_devices(group_uuids)
-                click.echo(f"Job ID: {job_id} for {len(group_uuids)} devices")
-                db.insert_job(job_id, len(group_uuids))
+                job_id, job_size = client.register_devices(group_uuids, remove_errors=True)
+                if job_id and job_size:
+                    click.echo(f"Job ID: {job_id} for {job_size} devices")
+                    db.insert_job(job_id, job_size)
 
     # wait for all jobs to finish
     def _wait_for_jobs() -> None:
@@ -956,7 +963,11 @@ def bulk_so_download(
         uuids = db.get_uuids(empty=True)
         if uuids:
             failure = True
-            click.echo(f"There are {len(uuids)} UUIDs without Secure Objects:")
+            click.echo(
+                f"There are {len(uuids)} UUIDs without Secure Objects. "
+                "Either because already successfully registered in another device group, or "
+                "the UUIDs were not found for given product, or UUIDs are invalid."
+            )
             for uuid in uuids:
                 click.echo(uuid)
 

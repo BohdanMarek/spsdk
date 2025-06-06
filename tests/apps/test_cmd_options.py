@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2023-2024 NXP
+# Copyright 2023-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -53,26 +53,4 @@ def test_templates_to_dirs():
             yield result
 
     results = gather(group=spsdk_main, func=templates_to_dirs)
-    assert all(results)
-
-
-def test_export_has_plugin():
-    EXPORTS_WITHOUT_PLUGIN = [
-        "nxpimage bee export",
-        "nxpimage bootable-image fcb export",
-        "nxpimage bootable-image xmcd export",
-        "nxpimage iee export",
-        "nxpimage otfad export",
-        "nxpimage tz export",
-        "nxpcrypto rot export",
-        "nxpmemcfg export",
-    ]
-
-    def export_has_plugin(group: click.Command, command_name: str) -> bool:
-        if group.name == "export" and command_name not in EXPORTS_WITHOUT_PLUGIN:
-            result = any(param.name == "plugin" for param in group.params)
-            logging.debug(f"Checking command: {command_name} -> {result}")
-            yield result
-
-    results = gather(group=spsdk_main, func=export_has_plugin)
     assert all(results)

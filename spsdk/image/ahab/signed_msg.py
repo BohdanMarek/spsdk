@@ -1,15 +1,22 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2021-2024 NXP
+# Copyright 2021-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
-"""Implementation of raw AHAB container support.
+"""AHAB signed message implementation.
 
-This module represents a generic AHAB container implementation. You can set the
-containers values at will. From this perspective, consult with your reference
-manual of your device for allowed values.
+This module provides classes and functions to create, parse, and manipulate AHAB
+(Advanced High Assurance Boot) signed messages. The implementation supports various
+message types such as key provisioning, lifecycle management, secure fuse operations,
+and debug authentication.
+
+Signed messages are used for secure communication with NXP devices that support
+EdgeLock security features. The module allows customization of container values
+according to device-specific requirements - consult your device reference manual
+for allowed values and message formats.
 """
+
 import datetime
 import logging
 from abc import abstractmethod
@@ -18,8 +25,19 @@ from struct import calcsize, pack, unpack
 from typing import Any, Optional, Type, Union
 
 from typing_extensions import Self, TypeAlias
+from x690.types import TypeClass, TypeNature, X690Type, decode
 
-from spsdk.exceptions import SPSDKError, SPSDKParsingError, SPSDKValueError
+from spsdk.crypto.cmac import cmac
+from spsdk.crypto.crypto_types import SPSDKEncoding
+from spsdk.crypto.hkdf import hkdf
+from spsdk.crypto.keys import PrivateKey
+from spsdk.crypto.symmetric import aes_cbc_encrypt, aes_key_wrap
+from spsdk.exceptions import (
+    SPSDKError,
+    SPSDKNotImplementedError,
+    SPSDKParsingError,
+    SPSDKValueError,
+)
 from spsdk.image.ahab.ahab_abstract_interfaces import Container
 from spsdk.image.ahab.ahab_container import AHABContainerBase
 from spsdk.image.ahab.ahab_data import (
@@ -31,25 +49,31 @@ from spsdk.image.ahab.ahab_data import (
     UINT32,
     AhabChipConfig,
     FlagsSrkSet,
+    KeyAlgorithm,
+    KeyDerivationAlgorithm,
+    KeyImportSigningAlgorithm,
+    KeyType,
+    KeyUsage,
+    LifeCycle,
+    LifeTime,
+    WrappingAlgorithm,
     create_chip_config,
 )
 from spsdk.image.ahab.ahab_sign_block import SignatureBlock, SignatureBlockV2
 from spsdk.image.ahab.ahab_signature import ContainerSignature
-from spsdk.utils.database import DatabaseManager, get_db, get_families, get_schema_file
-from spsdk.utils.images import BinaryImage
+from spsdk.utils.abstract_features import FeatureBaseClass
+from spsdk.utils.binary_image import BinaryImage
+from spsdk.utils.config import Config
+from spsdk.utils.database import DatabaseManager, get_schema_file
+from spsdk.utils.family import FamilyRevision, get_db, update_validation_schema_family
 from spsdk.utils.misc import (
     BinaryPattern,
     Endianness,
     align_block,
-    load_hex_string,
     reverse_bytes_in_longs,
     value_to_int,
 )
-from spsdk.utils.schema_validator import (
-    CommentedConfig,
-    check_config,
-    update_validation_schema_family,
-)
+from spsdk.utils.schema_validator import CommentedConfig
 from spsdk.utils.spsdk_enum import SpsdkEnum
 from spsdk.utils.verifier import Verifier, VerifierResult
 
@@ -75,6 +99,11 @@ class MessageCommands(SpsdkEnum):
         0x47,
         "KEY_EXCHANGE_REQ",
         "Key exchange signed message content",
+    )
+    KEY_IMPORT_REQ = (
+        0x4F,
+        "KEY_IMPORT_REQ",
+        "Key import signed message content",
     )
     WRITE_SEC_FUSE_REQ = (0x91, "WRITE_SEC_FUSE_REQ", "Write secure fuse request.")
     RETURN_LIFECYCLE_UPDATE_REQ = (
@@ -153,9 +182,8 @@ class Message(Container):
         if len(self.unique_id) > self.unique_id_len:
             logger.warning(
                 f"The given UUID is longer than used {self.unique_id_len} "
-                f"bytes and its truncated to {self.unique_id[:self.unique_id_len].hex()}"
+                "bytes and will be truncated"
             )
-            self.unique_id = self.unique_id[: self.unique_id_len]
 
     def __repr__(self) -> str:
         return f"Message, {MessageCommands.get_description(self.TAG, 'Base Class')}"
@@ -212,7 +240,7 @@ class Message(Container):
             "Unique ID",
             self.unique_id,
             min_length=self.unique_id_len,
-            max_length=self.unique_id_len,
+            max_length=16,
         )
         return ret
 
@@ -242,27 +270,22 @@ class Message(Container):
         """
 
     @classmethod
-    def load_from_config(
-        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
-    ) -> Self:
+    def load_from_config(cls, config: Config) -> Self:
         """Converts the configuration option into an message object.
 
         "config" content of container configurations.
 
         :param config: Message configuration dictionaries.
-        :param search_paths: List of paths where to search for the file, defaults to None
         :return: Message object.
         """
-        command = config.get("command")
-        if not (isinstance(command, dict) and len(command) == 1):
+        command = config.get_dict("command")
+        if len(command) != 1:
             raise SPSDKError(f"Invalid config field command: {command}")
         msg_cls = cls.get_message_class(list(command.keys())[0])
-        return msg_cls.load_from_config(config, search_paths=search_paths)
+        return msg_cls._load_from_config(config, cls)
 
     @classmethod
-    def load_from_config_generic(
-        cls, config: dict[str, Any]
-    ) -> tuple[int, int, Optional[int], bytes]:
+    def load_from_config_generic(cls, config: Config) -> tuple[int, int, Optional[int], bytes]:
         """Converts the general configuration option into an message object.
 
         "config" content of container configurations.
@@ -270,12 +293,10 @@ class Message(Container):
         :param config: Message configuration dictionaries.
         :return: Message object.
         """
-        cert_ver = value_to_int(config.get("cert_version", 0))
-        permission = value_to_int(config.get("cert_permission", 0))
-        issue_date_raw = config.get("issue_date", None)
-        if issue_date_raw:
-            assert isinstance(issue_date_raw, str)
-            year, month = issue_date_raw.split("-")
+        cert_ver = config.get_int("cert_version", 0)
+        permission = config.get_int("cert_permission", 0)
+        if "issue_date" in config:
+            year, month = config.get_str("issue_date").split("-")
             issue_date = max(min(12, int(month)), 1) << 12 | int(year)
         else:
             issue_date = None
@@ -283,13 +304,26 @@ class Message(Container):
         uuid = bytes.fromhex(config.get("uuid", bytes(cls.UNIQUE_ID_LEN).hex()))
         return (cert_ver, permission, issue_date, uuid)
 
-    def _create_general_config(self) -> dict[str, Any]:
+    @classmethod
+    def _load_from_config(cls, config: Config, base_cls: type["Message"]) -> Self:
+        """Converts the configuration option into an message object.
+
+        "config" content of container configurations.
+
+        :param config: Message configuration dictionaries.
+        :param base_cls: Base message class for configuration loading.
+        :raises SPSDKError: Invalid configuration detected.
+        :return: Message object.
+        """
+        raise SPSDKNotImplementedError("'_load_from_config' must be implemented in child class")
+
+    def _create_general_config(self) -> Config:
         """Create configuration of the general parts of  Message.
 
         :return: Configuration dictionary.
         """
         assert isinstance(self.unique_id, bytes)
-        cfg: dict[str, Any] = {}
+        cfg = Config()
         cfg["cert_version"] = self.cert_ver
         cfg["cert_permission"] = self.permissions
         cfg["issue_date"] = f"{(self.issue_date & 0xfff)}-{(self.issue_date>>12) & 0xf}"
@@ -298,7 +332,7 @@ class Message(Container):
         return cfg
 
     @abstractmethod
-    def create_config(self) -> dict[str, Any]:
+    def get_config(self) -> Config:
         """Create configuration of the Signed Message.
 
         :return: Configuration dictionary.
@@ -340,6 +374,7 @@ class Message(Container):
             permissions=permission,
             issue_date=issue_date,
             unique_id=cls.convert_uuid(uuid),
+            unique_id_len=cls.UNIQUE_ID_LEN,
         )
         parsed_msg.parse_payload(data[cls.fixed_length() :])
         return parsed_msg
@@ -423,20 +458,18 @@ class MessageReturnLifeCycle(Message):
         self.life_cycle = int.from_bytes(data[:4], byteorder=Endianness.LITTLE.value)
 
     @classmethod
-    def load_from_config(
-        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
-    ) -> Self:
+    def _load_from_config(cls, config: Config, base_cls: type[Message] = Message) -> Self:
         """Converts the configuration option into an message object.
 
         "config" content of container configurations.
 
         :param config: Message configuration dictionaries.
-        :param search_paths: List of paths where to search for the file, defaults to None
+        :param base_cls: Base message class for configuration loading.
         :raises SPSDKError: Invalid configuration detected.
         :return: Message object.
         """
-        command = config.get("command", {})
-        if not isinstance(command, dict) or len(command) != 1:
+        command = config.get_config("command")
+        if len(command) != 1:
             raise SPSDKError(f"Invalid config field command: {command}")
         command_name = list(command.keys())[0]
         if MessageCommands.from_label(command_name) != MessageReturnLifeCycle.TAG:
@@ -444,18 +477,18 @@ class MessageReturnLifeCycle(Message):
 
         cert_ver, permission, issue_date, uuid = cls.load_from_config_generic(config)
 
-        life_cycle = command.get("RETURN_LIFECYCLE_UPDATE_REQ")
-        assert isinstance(life_cycle, int)
+        life_cycle = command.get_int("RETURN_LIFECYCLE_UPDATE_REQ")
 
         return cls(
             cert_ver=cert_ver,
             permissions=permission,
             issue_date=issue_date,
             unique_id=uuid,
+            unique_id_len=base_cls.UNIQUE_ID_LEN,
             life_cycle=life_cycle,
         )
 
-    def create_config(self) -> dict[str, Any]:
+    def get_config(self) -> Config:
         """Create configuration of the Signed Message.
 
         :return: Configuration dictionary.
@@ -556,20 +589,18 @@ class MessageWriteSecureFuse(Message):
             )
 
     @classmethod
-    def load_from_config(
-        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
-    ) -> Self:
+    def _load_from_config(cls, config: Config, base_cls: type[Message] = Message) -> Self:
         """Converts the configuration option into an message object.
 
         "config" content of container configurations.
 
         :param config: Message configuration dictionaries.
-        :param search_paths: List of paths where to search for the file, defaults to None
+        :param base_cls: Base message class for configuration loading.
         :raises SPSDKError: Invalid configuration detected.
         :return: Message object.
         """
-        command = config.get("command", {})
-        if not isinstance(command, dict) or len(command) != 1:
+        command = config.get_config("command")
+        if len(command) != 1:
             raise SPSDKError(f"Invalid config field command: {command}")
         command_name = list(command.keys())[0]
         if MessageCommands.from_label(command_name) != MessageWriteSecureFuse.TAG:
@@ -577,12 +608,10 @@ class MessageWriteSecureFuse(Message):
 
         cert_ver, permission, issue_date, uuid = cls.load_from_config_generic(config)
 
-        secure_fuse = command.get("WRITE_SEC_FUSE_REQ")
-        assert isinstance(secure_fuse, dict)
-        fuse_id = secure_fuse.get("id")
-        assert isinstance(fuse_id, int)
-        flags: int = secure_fuse.get("flags", 0)
-        data_list: list = secure_fuse.get("data", [])
+        secure_fuse = command.get_config("WRITE_SEC_FUSE_REQ")
+        fuse_id = secure_fuse.get_int("id")
+        flags = secure_fuse.get_int("flags", 0)
+        data_list = secure_fuse.get_list("data", [])
         data = []
         for x in data_list:
             data.append(value_to_int(x))
@@ -592,13 +621,14 @@ class MessageWriteSecureFuse(Message):
             permissions=permission,
             issue_date=issue_date,
             unique_id=uuid,
+            unique_id_len=base_cls.UNIQUE_ID_LEN,
             fuse_id=fuse_id,
             length=length,
             flags=flags,
             data=data,
         )
 
-    def create_config(self) -> dict[str, Any]:
+    def get_config(self) -> Config:
         """Create configuration of the Signed Message.
 
         :return: Configuration dictionary.
@@ -715,20 +745,18 @@ class MessageKeyStoreReprovisioningEnable(Message):
         return ret
 
     @classmethod
-    def load_from_config(
-        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
-    ) -> Self:
+    def _load_from_config(cls, config: Config, base_cls: type[Message] = Message) -> Self:
         """Converts the configuration option into an message object.
 
         "config" content of container configurations.
 
         :param config: Message configuration dictionaries.
-        :param search_paths: List of paths where to search for the file, defaults to None
+        :param base_cls: Base message class for configuration loading.
         :raises SPSDKError: Invalid configuration detected.
         :return: Message object.
         """
-        command = config.get("command", {})
-        if not isinstance(command, dict) or len(command) != 1:
+        command = config.get_config("command")
+        if len(command) != 1:
             raise SPSDKError(f"Invalid config field command: {command}")
         command_name = list(command.keys())[0]
         if MessageCommands.from_label(command_name) != cls.TAG:
@@ -736,20 +764,20 @@ class MessageKeyStoreReprovisioningEnable(Message):
 
         cert_ver, permission, issue_date, uuid = cls.load_from_config_generic(config)
 
-        keystore_repr_en = command.get("KEYSTORE_REPROVISIONING_ENABLE_REQ")
-        assert isinstance(keystore_repr_en, dict)
-        monotonic_counter = value_to_int(keystore_repr_en.get("monotonic_counter", 0))
-        user_sab_id = value_to_int(keystore_repr_en.get("user_sab_id", 0))
+        keystore_repr_en = command.get_config("KEYSTORE_REPROVISIONING_ENABLE_REQ")
+        monotonic_counter = keystore_repr_en.get_int("monotonic_counter", 0)
+        user_sab_id = keystore_repr_en.get_int("user_sab_id", 0)
         return cls(
             cert_ver=cert_ver,
             permissions=permission,
             issue_date=issue_date,
             unique_id=uuid,
+            unique_id_len=base_cls.UNIQUE_ID_LEN,
             monotonic_counter=monotonic_counter,
             user_sab_id=user_sab_id,
         )
 
-    def create_config(self) -> dict[str, Any]:
+    def get_config(self) -> Config:
         """Create configuration of the Signed Message.
 
         :return: Configuration dictionary.
@@ -793,101 +821,6 @@ class MessageKeyExchange(Message):
         + "32s"  # Input user fixed info digest word [0-7]
     )
 
-    class KeyExchangeAlgorithm(SpsdkEnum):
-        """Key Exchange Algorithm valid values."""
-
-        HKDF_SHA256 = (0x09020109, "HKDF SHA256")
-        HKDF_SHA384 = (0x0902010A, "HKDF SHA384")
-
-    class KeyDerivationAlgorithm(SpsdkEnum):
-        """Key Derivation Algorithm valid values."""
-
-        HKDF_SHA256 = (0x08000109, "HKDF SHA256", "HKDF SHA256 (HMAC two-step)")
-        HKDF_SHA384 = (0x0800010A, "HKDF SHA384", "HKDF SHA384 (HMAC two-step)")
-
-    class DerivedKeyType(SpsdkEnum):
-        """Derived Key Type valid values."""
-
-        AES = (0x2400, "AES SHA256", "Possible bit widths: 128/192/256")
-        HMAC = (0x1100, "HMAC SHA384", "Possible bit widths: 224/256/384/512")
-        OEM_IMPORT_MK_SK = (0x9200, "OEM_IMPORT_MK_SK", "Possible bit widths: 128/192/256")
-
-    class LifeCycle(SpsdkEnum):
-        """Chip life cycle valid values."""
-
-        CURRENT = (0x00, "CURRENT", "Current device lifecycle")
-        OPEN = (0x01, "OPEN")
-        CLOSED = (0x02, "CLOSED")
-        LOCKED = (0x04, "LOCKED")
-
-    class LifeTime(SpsdkEnum):
-        """Edgelock Enclave life time valid values."""
-
-        VOLATILE = (0x00, "VOLATILE", "Standard volatile key")
-        PERSISTENT = (0x01, "PERSISTENT", "Standard persistent key")
-        PERMANENT = (0xFF, "PERMANENT", "Standard permanent key")
-
-    class DerivedKeyUsage(SpsdkEnum):
-        """Derived Key Usage valid values."""
-
-        CACHE = (
-            0x00000004,
-            "Cache",
-            (
-                "Permission to cache the key in the ELE internal secure memory. "
-                "This usage is set by default by ELE FW for all keys generated or imported."
-            ),
-        )
-        ENCRYPT = (
-            0x00000100,
-            "Encrypt",
-            (
-                "Permission to encrypt a message with the key. It could be cipher encryption,"
-                " AEAD encryption or asymmetric encryption operation."
-            ),
-        )
-        DECRYPT = (
-            0x00000200,
-            "Decrypt",
-            (
-                "Permission to decrypt a message with the key. It could be cipher decryption,"
-                " AEAD decryption or asymmetric decryption operation."
-            ),
-        )
-        SIGN_MSG = (
-            0x00000400,
-            "Sign message",
-            (
-                "Permission to sign a message with the key. It could be a MAC generation or an "
-                "asymmetric message signature operation."
-            ),
-        )
-        VERIFY_MSG = (
-            0x00000800,
-            "Verify message",
-            (
-                "Permission to verify a message signature with the key. It could be a MAC "
-                "verification or an asymmetric message signature verification operation."
-            ),
-        )
-        SIGN_HASH = (
-            0x00001000,
-            "Sign hash",
-            (
-                "Permission to sign a hashed message with the key with an asymmetric signature "
-                "operation. Setting this permission automatically sets the Sign Message usage."
-            ),
-        )
-        VERIFY_HASH = (
-            0x00002000,
-            "Sign message",
-            (
-                "Permission to verify a hashed message signature with the key with an asymmetric "
-                "signature verification operation. Setting this permission automatically sets the Verify Message usage."
-            ),
-        )
-        DERIVE = (0x00004000, "Derive", "Permission to derive other keys from this key.")
-
     def __init__(
         self,
         cert_ver: int = 0,
@@ -896,13 +829,13 @@ class MessageKeyExchange(Message):
         unique_id: Optional[bytes] = None,
         unique_id_len: int = Message.UNIQUE_ID_LEN,
         key_store_id: int = 0,
-        key_exchange_algorithm: KeyExchangeAlgorithm = KeyExchangeAlgorithm.HKDF_SHA256,
+        key_exchange_algorithm: KeyAlgorithm = KeyAlgorithm.HKDF_SHA256,
         salt_flags: int = 0,
         derived_key_grp: int = 0,
         derived_key_size_bits: int = 0,
-        derived_key_type: DerivedKeyType = DerivedKeyType.AES,
+        derived_key_type: KeyType = KeyType.AES,
         derived_key_lifetime: LifeTime = LifeTime.PERSISTENT,
-        derived_key_usage: Optional[list[DerivedKeyUsage]] = None,
+        derived_key_usage: Optional[list[KeyUsage]] = None,
         derived_key_permitted_algorithm: KeyDerivationAlgorithm = KeyDerivationAlgorithm.HKDF_SHA256,
         derived_key_lifecycle: LifeCycle = LifeCycle.OPEN,
         derived_key_id: int = 0,
@@ -1091,43 +1024,39 @@ class MessageKeyExchange(Message):
         ) = unpack(self.PAYLOAD_FORMAT, data[: self.PAYLOAD_LENGTH])
 
         # Do some post process
-        self.key_exchange_algorithm = self.KeyExchangeAlgorithm.from_tag(key_exchange_algorithm)
-        self.derived_key_type = self.DerivedKeyType.from_tag(derived_key_type)
-        self.derived_key_lifetime = self.LifeTime.from_tag(derived_key_lifetime)
-        self.derived_key_permitted_algorithm = self.KeyDerivationAlgorithm.from_tag(
+        self.key_exchange_algorithm = KeyAlgorithm.from_tag(key_exchange_algorithm)
+        self.derived_key_type = KeyType.from_tag(derived_key_type)
+        self.derived_key_lifetime = LifeTime.from_tag(derived_key_lifetime)
+        self.derived_key_permitted_algorithm = KeyDerivationAlgorithm.from_tag(
             derived_key_permitted_algorithm
         )
-        self.derived_key_lifecycle = self.LifeCycle.from_tag(derived_key_lifecycle)
+        self.derived_key_lifecycle = LifeCycle.from_tag(derived_key_lifecycle)
 
         self.input_peer_public_key_digest = input_peer_public_key_digest
         self.input_user_fixed_info_digest = input_user_fixed_info_digest
         self.derived_key_usage.clear()
-        for tag in self.DerivedKeyUsage.tags():
+        for tag in KeyUsage.tags():
             if tag & derived_key_usage:
-                self.derived_key_usage.append(self.DerivedKeyUsage.from_tag(tag))
+                self.derived_key_usage.append(KeyUsage.from_tag(tag))
 
     def verify(self) -> Verifier:
         """Verify message properties."""
         ret = super().verify()
         ret.add_record_range("KeyStore ID", self.key_store_id)
-        ret.add_record_enum(
-            "Key exchange algorithm", self.key_exchange_algorithm, self.KeyExchangeAlgorithm
-        )
+        ret.add_record_enum("Key exchange algorithm", self.key_exchange_algorithm, KeyAlgorithm)
         ret.add_record_range("Salt flags", self.salt_flags)
         ret.add_record_range("Derived key group", self.derived_key_grp)
         ret.add_record_range("Derived key bit size", self.derived_key_size_bits)
-        ret.add_record_enum("Derived key type", self.derived_key_type, self.DerivedKeyType)
-        ret.add_record_enum("Derived key life time", self.derived_key_lifetime, self.LifeTime)
+        ret.add_record_enum("Derived key type", self.derived_key_type, KeyType)
+        ret.add_record_enum("Derived key life time", self.derived_key_lifetime, LifeTime)
         for key_usage in self.derived_key_usage:
-            ret.add_record_enum(
-                f"Derived key usage [{key_usage.label}]", key_usage, self.DerivedKeyUsage
-            )
+            ret.add_record_enum(f"Derived key usage [{key_usage.label}]", key_usage, KeyUsage)
         ret.add_record_enum(
             "Derived key permitted algorithm",
             self.derived_key_permitted_algorithm,
-            self.KeyDerivationAlgorithm,
+            KeyDerivationAlgorithm,
         )
-        ret.add_record_enum("Derived key life cycle", self.derived_key_lifecycle, self.LifeCycle)
+        ret.add_record_enum("Derived key life cycle", self.derived_key_lifecycle, LifeCycle)
         ret.add_record_range("Derived key ID", self.derived_key_id)
         ret.add_record_range("Private key ID", self.private_key_id)
         ret.add_record_bytes(
@@ -1164,20 +1093,18 @@ class MessageKeyExchange(Message):
         return ret
 
     @classmethod
-    def load_from_config(
-        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
-    ) -> Self:
+    def _load_from_config(cls, config: Config, base_cls: type[Message] = Message) -> Self:
         """Converts the configuration option into an message object.
 
         "config" content of container configurations.
 
         :param config: Message configuration dictionaries.
-        :param search_paths: List of paths where to search for the file, defaults to None
+        :param base_cls: Base message class for configuration loading.
         :raises SPSDKError: Invalid configuration detected.
         :return: Message object.
         """
-        command = config.get("command", {})
-        if not isinstance(command, dict) or len(command) != 1:
+        command = config.get_config("command")
+        if len(command) != 1:
             raise SPSDKError(f"Invalid config field command: {command}")
         command_name = list(command.keys())[0]
         if MessageCommands.from_label(command_name) != MessageKeyExchange.TAG:
@@ -1185,43 +1112,35 @@ class MessageKeyExchange(Message):
 
         cert_ver, permission, issue_date, uuid = cls.load_from_config_generic(config)
 
-        key_exchange = command.get("KEY_EXCHANGE_REQ")
-        assert isinstance(key_exchange, dict)
+        key_exchange = command.get_config("KEY_EXCHANGE_REQ")
 
-        key_store_id = value_to_int(key_exchange.get("key_store_id", 0))
-        key_exchange_algorithm = MessageKeyExchange.KeyExchangeAlgorithm.from_attr(
-            key_exchange.get("key_exchange_algorithm", "HKDF SHA256")
+        key_store_id = key_exchange.get_int("key_store_id", 0)
+        key_exchange_algorithm = KeyAlgorithm.from_attr(
+            key_exchange.get_str("key_exchange_algorithm", "HKDF SHA256")
         )
-        salt_flags = value_to_int(key_exchange.get("salt_flags", 0))
-        derived_key_grp = value_to_int(key_exchange.get("derived_key_grp", 0))
-        derived_key_size_bits = value_to_int(key_exchange.get("derived_key_size_bits", 128))
-        derived_key_type = MessageKeyExchange.DerivedKeyType.from_attr(
-            key_exchange.get("derived_key_type", "AES SHA256")
-        )
-        derived_key_lifetime = MessageKeyExchange.LifeTime.from_attr(
-            key_exchange.get("derived_key_lifetime", "PERSISTENT")
+        salt_flags = key_exchange.get_int("salt_flags", 0)
+        derived_key_grp = key_exchange.get_int("derived_key_grp", 0)
+        derived_key_size_bits = key_exchange.get_int("derived_key_size_bits", 128)
+        derived_key_type = KeyType.from_attr(key_exchange.get_str("derived_key_type", "AES SHA256"))
+        derived_key_lifetime = LifeTime.from_attr(
+            key_exchange.get_str("derived_key_lifetime", "PERSISTENT")
         )
         derived_key_usage = [
-            MessageKeyExchange.DerivedKeyUsage.from_attr(x)
-            for x in key_exchange.get("derived_key_usage", [])
+            KeyUsage.from_attr(x) for x in key_exchange.get_list("derived_key_usage", [])
         ]
-        derived_key_permitted_algorithm = MessageKeyExchange.KeyDerivationAlgorithm.from_attr(
-            key_exchange.get("derived_key_permitted_algorithm", "HKDF SHA256")
+        derived_key_permitted_algorithm = KeyDerivationAlgorithm.from_attr(
+            key_exchange.get_str("derived_key_permitted_algorithm", "HKDF SHA256")
         )
-        derived_key_lifecycle = MessageKeyExchange.LifeCycle.from_attr(
-            key_exchange.get("derived_key_lifecycle", "OPEN")
+        derived_key_lifecycle = LifeCycle.from_attr(
+            key_exchange.get_str("derived_key_lifecycle", "OPEN")
         )
-        derived_key_id = value_to_int(key_exchange.get("derived_key_id", 0))
-        private_key_id = value_to_int(key_exchange.get("private_key_id", 0))
-        input_peer_public_key_digest = load_hex_string(
-            source=key_exchange.get("input_peer_public_key_digest", bytes(32)),
-            expected_size=32,
-            search_paths=search_paths,
+        derived_key_id = key_exchange.get_int("derived_key_id", 0)
+        private_key_id = key_exchange.get_int("private_key_id", 0)
+        input_peer_public_key_digest = key_exchange.load_symmetric_key(
+            "input_peer_public_key_digest", expected_size=32, default=bytes(32)
         )
-        input_user_fixed_info_digest = load_hex_string(
-            source=key_exchange.get("input_user_fixed_info_digest", bytes(32)),
-            expected_size=32,
-            search_paths=search_paths,
+        input_user_fixed_info_digest = key_exchange.load_symmetric_key(
+            "input_user_fixed_info_digest", expected_size=32, default=bytes(32)
         )
 
         return cls(
@@ -1229,6 +1148,7 @@ class MessageKeyExchange(Message):
             permissions=permission,
             issue_date=issue_date,
             unique_id=uuid,
+            unique_id_len=base_cls.UNIQUE_ID_LEN,
             key_store_id=key_store_id,
             key_exchange_algorithm=key_exchange_algorithm,
             salt_flags=salt_flags,
@@ -1245,7 +1165,7 @@ class MessageKeyExchange(Message):
             input_user_fixed_info_digest=input_user_fixed_info_digest,
         )
 
-    def create_config(self) -> dict[str, Any]:
+    def get_config(self) -> Config:
         """Create configuration of the Signed Message.
 
         :return: Configuration dictionary.
@@ -1275,6 +1195,534 @@ class MessageKeyExchange(Message):
         )
 
         cmd_cfg[MessageCommands.get_label(self.TAG)] = key_exchange_cfg
+        cfg["command"] = cmd_cfg
+
+        return cfg
+
+
+class MessageKeyImport(Message):
+    """Key import request message class representation."""
+
+    TAG = MessageCommands.KEY_IMPORT_REQ.tag
+    PAYLOAD_VERSION = 0x07
+    HEADER_MAGIC = "edgelockenclaveimport"
+
+    def __init__(
+        self,
+        cert_ver: int = 0,
+        permissions: int = 0,
+        issue_date: Optional[int] = None,
+        unique_id: Optional[bytes] = None,
+        unique_id_len: int = Message.UNIQUE_ID_LEN,
+        key_id: int = 0,
+        key_import_algorithm: KeyAlgorithm = KeyAlgorithm.SHA256,
+        key_usage: Optional[list[KeyUsage]] = None,
+        key_type: KeyType = KeyType.AES,
+        key_size_bits: int = 0,
+        key_lifetime: LifeTime = LifeTime.ELE_KEY_IMPORT_PERMANENT,
+        key_lifecycle: LifeCycle = LifeCycle.OPEN,
+        oem_import_mk_sk_key_id: int = 0,
+        wrapping_algorithm: WrappingAlgorithm = WrappingAlgorithm.RFC3394,
+        iv: Optional[bytes] = None,
+        signing_algorithm: KeyImportSigningAlgorithm = KeyImportSigningAlgorithm.CMAC,
+        wrapped_private_key: bytes = bytes(),
+        signature: bytes = bytes(),
+    ) -> None:
+        """Key exchange signed message class init.
+
+        :param cert_ver: Certificate version, defaults to 0
+        :param permissions: Certificate permission, to be used in future
+            The stated permission must allow the operation requested by the signed message
+            , defaults to 0
+        :param issue_date: Issue date, defaults to None (Current date will be applied)
+        :param unique_id: UUID of device, defaults to None
+        :param unique_id_len: UUID length - 64 or 128 bits, defaults to 64 bits (8 bytes)
+        :param key_id: Key ID where to store the derived key. It must be the key store ID
+            related to the key management handle set in the command API, defaults to 0
+        :param key_import_algorithm: Algorithm used by the key import process:
+
+            | MD5 = 0x0200000
+            | SHA1 = 0x02000005
+            | SHA224 = 0x02000008
+            | SHA256 = 0x02000009
+            | SHA384 = 0x0200000A
+            | SHA512 = 0x0200000B
+            | , defaults to HKDF_SHA256
+
+        :param key_usage: Imported key usage attribute.
+
+            | Cache  0x00000004  Permission to cache the key in the ELE internal secure memory.
+            |                     This usage is set by default by ELE FW for all keys generated or imported.
+            | Encrypt  0x00000100  Permission to encrypt a message with the key. It could be cipher
+            |                     encryption, AEAD encryption or asymmetric encryption operation.
+            | Decrypt  0x00000200  Permission to decrypt a message with the key. It could be
+            |                     cipher decryption, AEAD decryption or asymmetric decryption operation.
+            | Sign message  0x00000400  Permission to sign a message with the key. It could be
+            |                     a MAC generation or an asymmetric message signature operation.
+            | Verify message  0x00000800  Permission to verify a message signature with the key.
+            |                     It could be a MAC verification or an asymmetric message signature
+            |                     verification operation.
+            | Sign hash  0x00001000  Permission to sign a hashed message with the key
+            |                     with an asymmetric signature operation. Setting this permission automatically
+            |                     sets the Sign Message usage.
+            | Verify hash  0x00002000  Permission to verify a hashed message signature with
+            |                     the key with an asymmetric signature verification operation.
+            |                     Setting this permission automatically sets the Verify Message usage.
+            | Derive  0x00004000  Permission to derive other keys from this key.
+            | , defaults to 0
+
+        :param key_type:
+
+            +-------------------+-------+------------------+
+            |Key type           | Value | Key size in bits |
+            +===================+=======+==================+
+            |   AES             |0x2400 | 128/192/256      |
+            +-------------------+-------+------------------+
+            |  HMAC             |0x1100 | 224/256/384/512  |
+            +-------------------+-------+------------------+
+            | OEM_IMPORT_MK_SK* |0x9200 | 128/192/256      |
+            +-------------------+-------+------------------+
+
+            , defaults to AES
+
+        :param key_size_bits:  Derived key size bits attribute, defaults to 0
+        :param key_lifetime: Imported key lifetime attribute
+
+            | ELE_KEY_IMPORT_VOLATILE           0xC0020000  Standard volatile key.
+            | ELE_KEY_IMPORT_PERSISTENT         0xC0020001  Standard persistent key.
+            | ELE_KEY_IMPORT_PERMANENT          0xC00200FF  Standard permanent key., defaults to PERSISTENT
+
+        :param key_lifecycle: Imported key lifecycle attribute
+
+            | CURRENT  0x00  Key is usable in current lifecycle.
+            | OPEN  0x01  Key is usable in open lifecycle.
+            | CLOSED  0x02  Key is usable in closed lifecycle.
+            | CLOSED and LOCKED  0x04  Key is usable in closed and locked lifecycle.
+            | , defaults to OPEN
+
+        :param oem_import_mk_sk_key_id: Identifier in the ELE key storage of the OEM_IMPORT_MK_SK key to use
+            to encrypt and sign the imported key, defaults to 0
+        :param wrapping_algorithm: Wrapping algorithm of the key blob. This field is
+            required to distinguish between different flavors of wrapping algorithms.
+
+            Possible values are:
+            - 0x01: RFC3394 wrapping
+            - 0x02: AES CBC wrapping
+
+        :param iv: IV to use for CBC wrapping. Not used if 'wrapping algorithm' not equal 0x02.
+        :param signing_algorithm: Algorithm used to sign the blob itself. Field “Signature” of this blob.
+            It must be: 0x01 (CMAC).
+        :param wrapped_private_key: Private key data in encrypted format as defined by the 'Wrapping Algorithm'.
+            Key used to do the encryption must be OEM_IMPORT_WRAP_SK derived from OEM_IMPORT_MK_SK.
+        :param signature: Signature of all previous fields of this blob including
+            the signature tag (0x5E) and signature length fields. Key used to do the signature must be
+            OEM_IMPORT_CMAC_SK derived from OEM_IMPORT_MK_SK.
+
+
+        """
+        super().__init__(
+            cert_ver=cert_ver,
+            permissions=permissions,
+            issue_date=issue_date,
+            cmd=self.TAG,
+            unique_id=unique_id,
+            unique_id_len=unique_id_len,
+        )
+        self.tag = self.TAG
+        self.version = self.PAYLOAD_VERSION
+        self.reserved = RESERVED
+        self.key_id = key_id
+        self.key_import_algorithm = key_import_algorithm
+        self.key_usage: list[KeyUsage] = key_usage or []
+        self.key_type = key_type
+        self.key_size_bits = key_size_bits
+        self.key_lifetime = key_lifetime
+        self.key_lifecycle = key_lifecycle
+        self.oem_import_mk_sk_key_id = oem_import_mk_sk_key_id
+        self.wrapping_algorithm = wrapping_algorithm
+        self.iv = iv or bytes(16)
+        self.signing_algorithm = signing_algorithm
+        self.wrapped_private_key = wrapped_private_key
+        self.signature = signature
+
+    @property
+    def payload_len(self) -> int:
+        """Message payload length in bytes."""
+        return len(self.export_payload())
+
+    def wrap_and_sign(
+        self, private_key: bytes, oem_import_mk_sk_key: bytes, srkh: Optional[bytes] = None
+    ) -> None:
+        """Get wrapped key and sign whole Import Key message.
+
+        :param private_key: Unwrapped private key
+        :param oem_import_mk_sk_key: OEM_IMPORT_MK_SK_KEY
+        :param srkh: Optionally SRKH if Salt flags requires it in Key Exchange commands, defaults to None
+        """
+        oem_import_wrap_sk = hkdf(
+            salt=srkh or bytes(32),
+            ikm=oem_import_mk_sk_key,
+            info="oemelefwkeyimportwrap256".encode(),
+            length=32,
+        )
+        oem_import_cmac_sk = hkdf(
+            salt=srkh or bytes(32),
+            ikm=oem_import_mk_sk_key,
+            info="oemelefwkeyimportcmac256".encode(),
+            length=32,
+        )
+        logger.info(f"Derived OEM_IMPORT_WRAP_SK: {oem_import_wrap_sk.hex()}")
+        logger.info(f"Derived OEM_IMPORT_CMAC_SK: {oem_import_cmac_sk.hex()}")
+        if self.wrapping_algorithm == WrappingAlgorithm.RFC3394:
+            self.wrapped_private_key = aes_key_wrap(kek=oem_import_wrap_sk, key_to_wrap=private_key)
+        elif self.wrapping_algorithm == WrappingAlgorithm.AES_CBC:
+            self.wrapped_private_key = aes_cbc_encrypt(
+                key=oem_import_wrap_sk, plain_data=private_key, iv_data=self.iv
+            )
+        else:
+            raise SPSDKError(f"Invalid wrapping algorithm: {self.wrapping_algorithm}")
+
+        self.signature = cmac(key=oem_import_cmac_sk, data=self.export_payload()[:-16])
+
+    class Ki(X690Type[bytes]):
+        """Key Import base field type."""
+
+        TAG = 0x00
+        TYPECLASS = TypeClass.APPLICATION
+        NATURE = [TypeNature.PRIMITIVE]
+
+    class KiMagic(Ki):
+        """TLV record - Magic header."""
+
+        TAG = 0x00
+
+    class KiKeyId(Ki):
+        """TLV record - Key ID."""
+
+        TAG = 0x01
+
+    class KiKeyAlgorithm(Ki):
+        """TLV record - Key algorithm."""
+
+        TAG = 0x02
+
+    class KiKeyUsage(Ki):
+        """TLV record - Key usage."""
+
+        TAG = 0x03
+
+    class KiKeyType(Ki):
+        """TLV record - Key type."""
+
+        TAG = 0x04
+
+    class KiKeyBitsSize(Ki):
+        """TLV record - Key size."""
+
+        TAG = 0x05
+
+    class KiKeyLifeTime(Ki):
+        """TLV record - Key life time."""
+
+        TAG = 0x06
+
+    class KiKeyLifeCycle(Ki):
+        """TLV record - Key life cycle."""
+
+        TAG = 0x07
+
+    class KiImportMkSkKeyId(Ki):
+        """TLV record - Import MK SK KEY id."""
+
+        TAG = 0x10
+
+    class KiWrappingAlgorithm(Ki):
+        """TLV record - Key wrapping algorithm."""
+
+        TAG = 0x11
+
+    class KiIv(Ki):
+        """TLV record - Optional Initial vector."""
+
+        TAG = 0x12
+
+    class KiSigningAlgorithm(Ki):
+        """TLV record - Key signing algorithm."""
+
+        TAG = 0x14
+
+    class KiEncryptedPrk(Ki):
+        """TLV record - Key wrapped data."""
+
+        TAG = 0x15
+
+    class KiSignature(Ki):
+        """TLV record - Signature."""
+
+        TAG = 0x1E
+
+    def export_payload(self) -> bytes:
+        """Exports message payload to bytes array.
+
+        :return: Bytes representation of message payload.
+        """
+        key_usage = 0
+        for usage in self.key_usage:
+            key_usage |= usage.tag
+
+        ret = bytes()
+        ret += bytes(self.KiMagic(self.HEADER_MAGIC.encode()))
+        ret += bytes(self.KiKeyId(self.key_id.to_bytes(4, "big")))
+        ret += bytes(self.KiKeyAlgorithm(self.key_import_algorithm.tag.to_bytes(4, "big")))
+        ret += bytes(self.KiKeyUsage(key_usage.to_bytes(4, "big")))
+        ret += bytes(self.KiKeyType(self.key_type.tag.to_bytes(2, "big")))
+        ret += bytes(self.KiKeyBitsSize(self.key_size_bits.to_bytes(4, "big")))
+        ret += bytes(self.KiKeyLifeTime(self.key_lifetime.tag.to_bytes(4, "big")))
+        ret += bytes(self.KiKeyLifeCycle(self.key_lifecycle.tag.to_bytes(4, "big")))
+        ret += bytes(self.KiImportMkSkKeyId(self.oem_import_mk_sk_key_id.to_bytes(4, "big")))
+        ret += bytes(self.KiWrappingAlgorithm(self.wrapping_algorithm.tag.to_bytes(4, "big")))
+        if self.wrapping_algorithm == WrappingAlgorithm.AES_CBC:
+            ret += bytes(self.KiIv(self.iv))
+        ret += bytes(self.KiSigningAlgorithm(self.signing_algorithm.tag.to_bytes(4, "big")))
+        ret += bytes(self.KiEncryptedPrk(self.wrapped_private_key))
+        ret += bytes(self.KiSignature(self.signature))
+
+        return ret
+
+    def parse_payload(self, data: bytes) -> None:
+        """Parse payload.
+
+        :param data: Binary data with Payload to parse.
+        """
+        tlv_magic, nxt = decode(data=data, enforce_type=self.KiMagic)
+        if tlv_magic.value.decode() != self.HEADER_MAGIC:
+            raise SPSDKParsingError("This is not Import Key datablob, magic value is invalid.")
+        tlv_key_id, nxt = decode(data=data, start_index=nxt, enforce_type=self.KiKeyId)
+        tlv_key_import_algorithm, nxt = decode(
+            data=data, start_index=nxt, enforce_type=self.KiKeyAlgorithm
+        )
+        tlv_key_usage, nxt = decode(data=data, start_index=nxt, enforce_type=self.KiKeyUsage)
+        tlv_key_type, nxt = decode(data=data, start_index=nxt, enforce_type=self.KiKeyType)
+        tlv_key_size_bits, nxt = decode(data=data, start_index=nxt, enforce_type=self.KiKeyBitsSize)
+        tlv_key_lifetime, nxt = decode(data=data, start_index=nxt, enforce_type=self.KiKeyLifeTime)
+        tlv_key_lifecycle, nxt = decode(
+            data=data, start_index=nxt, enforce_type=self.KiKeyLifeCycle
+        )
+        tlv_oem_import_mk_sk_key_id, nxt = decode(
+            data=data, start_index=nxt, enforce_type=self.KiImportMkSkKeyId
+        )
+        tlv_wrapping_algorithm, nxt = decode(
+            data=data, start_index=nxt, enforce_type=self.KiWrappingAlgorithm
+        )
+        wrapping_algorithm = WrappingAlgorithm.from_tag(
+            int.from_bytes(tlv_wrapping_algorithm.value, "big")
+        )
+        if wrapping_algorithm == WrappingAlgorithm.AES_CBC:
+            tlv_iv, nxt = decode(data=data, start_index=nxt, enforce_type=self.KiIv)
+        else:
+            tlv_iv = None
+        tlv_signing_algorithm, nxt = decode(
+            data=data, start_index=nxt, enforce_type=self.KiSigningAlgorithm
+        )
+        tlv_wrapped_private_key, nxt = decode(
+            data=data, start_index=nxt, enforce_type=self.KiEncryptedPrk
+        )
+        tlv_signature, nxt = decode(data=data, start_index=nxt, enforce_type=self.KiSignature)
+
+        # Do some post process
+
+        self.key_id = int.from_bytes(tlv_key_id.value, "big")
+        self.key_import_algorithm = KeyAlgorithm.from_tag(
+            int.from_bytes(tlv_key_import_algorithm.value, "big")
+        )
+        key_usage = int.from_bytes(tlv_key_usage.value, "big")
+        self.key_usage.clear()
+        for tag in KeyUsage.tags():
+            if tag & key_usage:
+                self.key_usage.append(KeyUsage.from_tag(tag))
+        self.key_type = KeyType.from_tag(int.from_bytes(tlv_key_type.value, "big"))
+        self.key_size_bits = int.from_bytes(tlv_key_size_bits.value, "big")
+        self.key_lifetime = LifeTime.from_tag(int.from_bytes(tlv_key_lifetime.value, "big"))
+        self.key_lifecycle = LifeCycle.from_tag(int.from_bytes(tlv_key_lifecycle.value, "big"))
+        self.oem_import_mk_sk_key_id = int.from_bytes(tlv_oem_import_mk_sk_key_id.value, "big")
+        self.wrapping_algorithm = WrappingAlgorithm.from_tag(
+            int.from_bytes(tlv_wrapping_algorithm.value, "big")
+        )
+        self.iv = tlv_iv.value if tlv_iv else bytes(32)
+        self.signing_algorithm = KeyImportSigningAlgorithm.from_tag(
+            int.from_bytes(tlv_signing_algorithm.value, "big")
+        )
+        self.wrapped_private_key = tlv_wrapped_private_key.value
+        self.signature = tlv_signature.value
+
+    def verify(self) -> Verifier:
+        """Verify message properties."""
+        ret = super().verify()
+        ret.add_record_range("Key ID", self.key_id)
+        ret.add_record_enum("Key import algorithm", self.key_import_algorithm, KeyAlgorithm)
+        for key_usage in self.key_usage:
+            ret.add_record_enum(f"Key usage [{key_usage.label}]", key_usage, KeyUsage)
+        ret.add_record_enum("Key type", self.key_type, KeyType)
+        ret.add_record_range("Key bit size", self.key_size_bits)
+        ret.add_record_enum("Key life time", self.key_lifetime, LifeTime)
+        ret.add_record_enum("Key life cycle", self.key_lifecycle, LifeCycle)
+        ret.add_record_range("OEM import MK SK key ID", self.oem_import_mk_sk_key_id)
+        ret.add_record_enum("Key wrapping algorithm", self.wrapping_algorithm, WrappingAlgorithm)
+        ret.add_record_bytes("Initial Vector", self.iv, min_length=16, max_length=16)
+        ret.add_record_enum(
+            "Key signing algorithm", self.signing_algorithm, KeyImportSigningAlgorithm
+        )
+        ret.add_record_bytes("Import key wrapped data", self.wrapped_private_key, min_length=4)
+        ret.add_record_bytes("Signature", self.signature, min_length=16, max_length=16)
+
+        return ret
+
+    def __str__(self) -> str:
+        ret = super().__str__() + "\n"
+        ret += f"  Key ID value: 0x{self.key_id:08X}, {self.key_id}\n"
+        ret += f"  Key import algorithm value: {self.key_import_algorithm.label}\n"
+        ret += f"  Key usage value: {[x.label for x in self.key_usage]}\n"
+        ret += f"  Key type value: {self.key_type.label}\n"
+        ret += f"  Key bit size value: 0x{self.key_size_bits:08X}, {self.key_size_bits}\n"
+        ret += f"  Key life time value: {self.key_lifetime.label}\n"
+        ret += f"  Key life cycle value: {self.key_lifecycle.label}\n"
+        ret += (
+            f"  OEM Import MK SK key ID value: 0x{self.oem_import_mk_sk_key_id:08X},"
+            f" {self.oem_import_mk_sk_key_id}\n"
+        )
+        ret += f"  Key wrapping algorithm: {self.wrapping_algorithm.label}\n"
+        ret += f"  Initial vector value: {self.iv.hex()}\n"
+        ret += f"  Key signing algorithm: {self.signing_algorithm.label}\n"
+        ret += f"  Import key wrapped data: {self.wrapped_private_key.hex()}\n"
+        ret += f"  Signature: {self.signature.hex()}"
+        return ret
+
+    @classmethod
+    def _load_from_config(cls, config: Config, base_cls: type[Message] = Message) -> Self:
+        """Converts the configuration option into an message object.
+
+        "config" content of container configurations.
+
+        :param config: Message configuration dictionaries.
+        :param base_cls: Base message class for configuration loading.
+        :raises SPSDKError: Invalid configuration detected.
+        :return: Message object.
+        """
+        command = config.get_config("command")
+        if len(command) != 1:
+            raise SPSDKError(f"Invalid config field command: {command}")
+        command_name = list(command.keys())[0]
+        if MessageCommands.from_label(command_name) != MessageKeyImport.TAG:
+            raise SPSDKError("Invalid configuration for Key Import Request command.")
+
+        cert_ver, permission, issue_date, uuid = cls.load_from_config_generic(config)
+
+        key_import = command.get_config("KEY_IMPORT_REQ")
+
+        key_id = key_import.get_int("key_id", 0)
+        key_algorithm = KeyAlgorithm.from_attr(key_import.get_str("key_import_algorithm", "SHA256"))
+        key_usage = [KeyUsage.from_attr(x) for x in key_import.get_list("key_usage", [])]
+        key_type = KeyType.from_attr(key_import.get_str("key_type", "AES SHA256"))
+        key_size_bits = key_import.get_int("key_size_bits", 128)
+        key_lifetime = LifeTime.from_attr(
+            key_import.get_str("key_lifetime", "ELE_KEY_IMPORT_PERMANENT")
+        )
+        key_lifecycle = LifeCycle.from_attr(key_import.get_str("key_lifecycle", "OPEN"))
+        oem_mk_sk_key_id = key_import.get_int("oem_mk_sk_key_id", 0)
+        key_wrapping_algorithm = WrappingAlgorithm.from_attr(
+            key_import.get_str("key_wrapping_algorithm", "RFC3394")
+        )
+        if key_wrapping_algorithm == WrappingAlgorithm.AES_CBC:
+            iv = key_import.load_symmetric_key(key="iv", expected_size=16, default=bytes(16))
+        else:
+            iv = None
+        signing_algorithm = KeyImportSigningAlgorithm.from_attr(
+            key_import.get_str("signing_algorithm", "CMAC")
+        )
+
+        ret = cls(
+            cert_ver=cert_ver,
+            permissions=permission,
+            issue_date=issue_date,
+            unique_id=uuid,
+            unique_id_len=base_cls.UNIQUE_ID_LEN,
+            key_id=key_id,
+            key_import_algorithm=key_algorithm,
+            key_usage=key_usage,
+            key_type=key_type,
+            key_size_bits=key_size_bits,
+            key_lifetime=key_lifetime,
+            key_lifecycle=key_lifecycle,
+            oem_import_mk_sk_key_id=oem_mk_sk_key_id,
+            wrapping_algorithm=key_wrapping_algorithm,
+            iv=iv,
+            signing_algorithm=signing_algorithm,
+            wrapped_private_key=bytes(4),
+            signature=bytes(16),
+        )
+
+        if "import_key" in key_import and "oem_import_mk_sk_key" in key_import:
+            logger.info(
+                "The Import key Signed message created with raw key and OEM_IMPORT_MK_SK key."
+            )
+            if key_type == KeyType.ECC:
+                import_key = PrivateKey.load(key_import.get_input_file_name("import_key")).export(
+                    encoding=SPSDKEncoding.NXP
+                )
+            else:
+                import_key = key_import.load_symmetric_key(
+                    "import_key", expected_size=key_size_bits // 8
+                )
+            oem_import_mk_sk_key = key_import.load_symmetric_key(
+                "oem_import_mk_sk_key", expected_size=32
+            )
+            srkh = (
+                key_import.load_symmetric_key("srkh", expected_size=32)
+                if "srkh" in key_import
+                else None
+            )
+            ret.wrap_and_sign(
+                private_key=import_key,
+                oem_import_mk_sk_key=oem_import_mk_sk_key,
+                srkh=srkh,
+            )
+        elif "wrapped_key" in key_import and "signature" in key_import:
+            logger.info(
+                "The Import key Signed message created with already wrapped key and signature."
+            )
+            ret.wrapped_private_key = key_import.get_bytes("wrapped_key", bytes(4))
+            ret.signature = key_import.load_symmetric_key(
+                "signature", expected_size=16, default=bytes(16)
+            )
+
+        else:
+            raise SPSDKValueError("Invalid IMPORT KEY configuration.")
+
+        return ret
+
+    def get_config(self) -> Config:
+        """Create configuration of the Signed Message.
+
+        :return: Configuration dictionary.
+        """
+        cfg = self._create_general_config()
+        key_import_cfg = Config()
+        cmd_cfg = Config()
+        key_import_cfg["key_id"] = f"0x{self.key_id:08X}"
+        key_import_cfg["key_import_algorithm"] = self.key_import_algorithm.label
+        key_import_cfg["key_usage"] = [x.label for x in self.key_usage]
+        key_import_cfg["key_type"] = self.key_type.label
+        key_import_cfg["key_size_bits"] = self.key_size_bits
+        key_import_cfg["key_lifetime"] = self.key_lifetime.label
+        key_import_cfg["key_lifecycle"] = self.key_lifecycle.label
+        key_import_cfg["oem_mk_sk_key_id"] = f"0x{self.oem_import_mk_sk_key_id:08X}"
+        key_import_cfg["key_wrapping_algorithm"] = self.wrapping_algorithm.label
+        key_import_cfg["iv"] = self.iv.hex()
+        key_import_cfg["signing_algorithm"] = self.signing_algorithm.label
+        key_import_cfg["wrapped_key"] = self.wrapped_private_key.hex()
+        key_import_cfg["signature"] = self.signature.hex()
+
+        cmd_cfg[MessageCommands.get_label(self.TAG)] = key_import_cfg
         cfg["command"] = cmd_cfg
 
         return cfg
@@ -1345,20 +1793,18 @@ class MessageDat(Message):
         self.authentication_beacon = int.from_bytes(data[32:34], byteorder=Endianness.LITTLE.value)
 
     @classmethod
-    def load_from_config(
-        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
-    ) -> Self:
+    def _load_from_config(cls, config: Config, base_cls: type[Message] = Message) -> Self:
         """Converts the configuration option into an message object.
 
         "config" content of container configurations.
 
         :param config: Message configuration dictionaries.
-        :param search_paths: List of paths where to search for the file, defaults to None
+        :param base_cls: Base message class for configuration loading.
         :raises SPSDKError: Invalid configuration detected.
         :return: Message object.
         """
-        command = config.get("command", {})
-        if not isinstance(command, dict) or len(command) != 1:
+        command = config.get_config("command")
+        if len(command) != 1:
             raise SPSDKError(f"Invalid config field command: {command}")
         command_name = list(command.keys())[0]
         if MessageCommands.from_label(command_name) != MessageDat.TAG:
@@ -1366,23 +1812,23 @@ class MessageDat(Message):
 
         cert_ver, permission, issue_date, uuid = cls.load_from_config_generic(config)
 
-        dat_cfg = command.get("DAT_AUTHENTICATION_REQ")
-        assert isinstance(dat_cfg, dict)
-        challenge_vector = load_hex_string(
-            dat_cfg["challenge_vector"], MessageDat.CHALLENGE_VECTOR_LEN, search_paths
+        dat_cfg = command.get_config("DAT_AUTHENTICATION_REQ")
+        challenge_vector = dat_cfg.load_symmetric_key(
+            "challenge_vector", MessageDat.CHALLENGE_VECTOR_LEN
         )
-        authentication_beacon = dat_cfg.get("authentication_beacon", 0)
+        authentication_beacon = dat_cfg.get_int("authentication_beacon", 0)
 
         return cls(
             cert_ver=cert_ver,
             permissions=permission,
             issue_date=issue_date,
             unique_id=uuid,
+            unique_id_len=base_cls.UNIQUE_ID_LEN,
             challenge_vector=challenge_vector,
             authentication_beacon=authentication_beacon,
         )
 
-    def create_config(self) -> dict[str, Any]:
+    def get_config(self) -> Config:
         """Create configuration of the Signed Message.
 
         :return: Configuration dictionary.
@@ -1661,7 +2107,7 @@ class SignedMessageContainer(AHABContainerBase):
         )
         return ret
 
-    def create_config(self, data_path: str) -> dict[str, Any]:
+    def get_config(self, data_path: str = "./") -> Config:
         """Create configuration of the Signed Message.
 
         :param data_path: Path to store the data files of configuration.
@@ -1671,34 +2117,26 @@ class SignedMessageContainer(AHABContainerBase):
         cfg["output"] = "N/A"
 
         assert isinstance(self.message, Message)
-        cfg["message"] = self.message.create_config()
+        cfg["message"] = self.message.get_config()
 
         return cfg
 
     @classmethod
-    def load_from_config(
-        cls,
-        chip_config: AhabChipConfig,
-        config: dict[str, Any],
-        search_paths: Optional[list[str]] = None,
-    ) -> Self:
+    def load_from_config(cls, chip_config: AhabChipConfig, config: Config) -> Self:
         """Converts the configuration option into an Signed message object.
 
         "config" content of container configurations.
 
         :param chip_config: Ahab chip configuration.
         :param config: Signed Message configuration dictionaries.
-        :param search_paths: List of paths where to search for the file, defaults to None
         :return: Message object.
         """
         signed_msg = cls(chip_config)
-        signed_msg.chip_config.base.search_paths = search_paths or []
         signed_msg.load_from_config_generic(config)
 
-        message = config.get("message")
-        assert isinstance(message, dict)
+        message = config.get_config("message")
 
-        signed_msg.message = cls.MESSAGE_TYPE.load_from_config(message, search_paths=search_paths)
+        signed_msg.message = cls.MESSAGE_TYPE.load_from_config(message)
 
         return signed_msg
 
@@ -1718,17 +2156,16 @@ class SignedMessageContainer(AHABContainerBase):
         return ret
 
     @classmethod
-    def get_validation_schemas(cls, family: str, revision: str = "latest") -> list[dict[str, Any]]:
+    def get_validation_schemas(cls, family: FamilyRevision) -> list[dict[str, Any]]:
         """Get list of validation schemas.
 
         :param family: Family for which the validation schema should be generated.
-        :param revision: Family revision of chip.
         :return: Validation list of schemas.
         """
         sch = get_schema_file(DatabaseManager.SIGNED_MSG)
         sch_family = get_schema_file("general")["family"]
         update_validation_schema_family(
-            sch_family["properties"], SignedMessage.get_supported_families(), family, revision
+            sch_family["properties"], SignedMessage.get_supported_families(), family
         )
         return [sch_family, sch["signed_message"]]
 
@@ -1741,24 +2178,23 @@ class SignedMessageContainerV2(SignedMessageContainer):
     MESSAGE_TYPE: TypeAlias = MessageV2
 
     @classmethod
-    def get_validation_schemas(cls, family: str, revision: str = "latest") -> list[dict[str, Any]]:
+    def get_validation_schemas(cls, family: FamilyRevision) -> list[dict[str, Any]]:
         """Get list of validation schemas.
 
         :param family: Family for which the validation schema should be generated.
-        :param revision: Family revision of chip.
         :return: Validation list of schemas.
         """
-        db = get_db(family, revision)
+        db = get_db(family)
         container_type = db.get_list(DatabaseManager.AHAB, "container_types", [])
         hide_force_container_type = len(container_type) <= 1
         container_type_2 = 2 in container_type
-        certificate_supported = db.get_bool(
-            DatabaseManager.AHAB, ["sub_features", "certificate_supported"], False
+        certificate_supported = "certificate_supported" in db.get_list(
+            DatabaseManager.AHAB, "sub_features", []
         )
         sch = get_schema_file(DatabaseManager.SIGNED_MSG)
         sch_family = get_schema_file("general")["family"]
         update_validation_schema_family(
-            sch_family["properties"], SignedMessage.get_supported_families(), family, revision
+            sch_family["properties"], SignedMessage.get_supported_families(), family
         )
 
         sch["signed_message"]["properties"]["container_version"][
@@ -1772,41 +2208,44 @@ class SignedMessageContainerV2(SignedMessageContainer):
             sch["signed_message"]["properties"]["srk_table"]["properties"]["srk_table_#2"][
                 "skip_in_template"
             ] = False
-            sch["signed_message"]["properties"]["signing_key_#2"]["skip_in_template"] = False
-            sch["signed_message"]["properties"]["signature_provider_#2"]["skip_in_template"] = False
+            sch["signed_message"]["properties"]["signer_#2"]["skip_in_template"] = False
         return [sch_family, sch["signed_message"]]
 
 
-class SignedMessage:
+class SignedMessage(FeatureBaseClass):
     """Signed message class."""
+
+    FEATURE = DatabaseManager.AHAB
 
     def __init__(
         self,
-        family: str,
-        revision: str = "latest",
+        family: FamilyRevision,
         signed_msg_container: Optional[
             Union[SignedMessageContainer, SignedMessageContainerV2]
         ] = None,
-        search_paths: Optional[list[str]] = None,
     ) -> None:
         """AHAB Image constructor.
 
         :param family: Name of device family.
-        :param revision: Device silicon revision, defaults to "latest"
         :param ahab_containers: _description_, defaults to None
-        :param search_paths: List of paths where to search for the file, defaults to None
         :raises SPSDKValueError: Invalid input configuration.
         """
-        self.chip_config = create_chip_config(
-            family=family,
-            revision=revision,
-            search_paths=search_paths,
-        )
+        self.chip_config = create_chip_config(family=family)
         self.signed_msg_container = signed_msg_container
         self._container_type: Optional[
             Union[Type[SignedMessageContainer], Type[SignedMessageContainerV2]]
         ] = None
-        self.db = get_db(family, revision)
+        self.db = get_db(family)
+
+    @property
+    def family(self) -> FamilyRevision:
+        """Just public family member."""
+        return self.chip_config.family
+
+    @family.setter
+    def family(self, value: FamilyRevision) -> None:
+        """Just public family member."""
+        self.chip_config.family = value
 
     @property
     def container_type(self) -> Union[Type[SignedMessageContainer], Type[SignedMessageContainerV2]]:
@@ -1868,7 +2307,7 @@ class SignedMessage:
             size=len(self),
             alignment=CONTAINER_ALIGNMENT,
             offset=0,
-            description=f"Signed Message Image for {self.chip_config.family}_{self.chip_config.revision}",
+            description=f"Signed Message Image for {self.chip_config.family}",
             pattern=BinaryPattern("zeros"),
         )
         if self.signed_msg_container:
@@ -1900,87 +2339,74 @@ class SignedMessage:
 
         return ret
 
-    def create_config(self, data_path: str) -> dict[str, Any]:
+    def get_config(self, data_path: str = "./") -> Config:
         """Create configuration of the Signed Message.
 
         :param data_path: Path to store the data files of configuration.
         :return: Configuration dictionary.
         """
         assert isinstance(self.signed_msg_container, SignedMessageContainer)
-        cfg = self.signed_msg_container.create_config(data_path)
-        cfg["family"] = self.chip_config.family
-        cfg["revision"] = self.chip_config.revision
+        cfg = self.signed_msg_container.get_config(data_path)
+        cfg["family"] = self.chip_config.family.name
+        cfg["revision"] = self.chip_config.family.revision
         return cfg
 
     @classmethod
-    def load_from_config(
-        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
-    ) -> Self:
+    def get_validation_schemas_from_cfg(cls, config: Config) -> list[dict[str, Any]]:
+        """Get validation schema based on configuration.
+
+        :param config: Valid configuration
+        :return: Validation schemas
+        """
+        config.check(cls.get_validation_schemas_basic())
+        family = FamilyRevision.load_from_config(config)
+        signed_msg_class = cls._get_signed_message_class(family)
+        return signed_msg_class.get_validation_schemas(family)
+
+    @classmethod
+    def load_from_config(cls, config: Config) -> Self:
         """Converts the configuration option into an Signed message object.
 
         "config" content of container configurations.
 
         :param config: Signed Message configuration dictionaries.
-        :param search_paths: List of paths where to search for the file, defaults to None
         :return: Signed message object.
         """
-        schemas_family = SignedMessage.get_family_validation_schemas()
-        check_config(config, schemas_family)
-        family = config["family"]
-        revision = config.get("revision", "latest")
-        signed_msg_class = cls._get_signed_message_class(family, revision)
-        schemas = signed_msg_class.get_validation_schemas(family, revision)
-        check_config(config, schemas, search_paths=search_paths)
+        cls.pre_check_config(config=config)
 
-        ret = cls(
-            family=family,
-            revision=revision,
-            search_paths=search_paths,
-        )
-        ret.signed_msg_container = signed_msg_class.load_from_config(
-            ret.chip_config, config, search_paths=search_paths
-        )
+        family = FamilyRevision.load_from_config(config)
+        signed_msg_class = cls._get_signed_message_class(family)
+
+        ret = cls(family=family)
+        ret.signed_msg_container = signed_msg_class.load_from_config(ret.chip_config, config)
         return ret
 
-    def parse(self, binary: bytes) -> None:
+    @classmethod
+    def parse(cls, data: bytes, family: Optional[FamilyRevision] = None) -> Self:
         """Parse input binary chunk to the container object.
+
+        :param data: Input binary data to parse
+        :param family: The MCU family
 
         :raises SPSDKError: No AHAB container found in binary data.
         """
-        signed_msg_class = self._parse_signed_message_type(binary)
-        signed_message = signed_msg_class.parse(binary, self.chip_config)
-        signed_message.verify().validate()
-        self.signed_msg_container = signed_message
+        if family is None:
+            raise SPSDKValueError("Missing family parameter to parse method of signed message")
+        ret = cls(family)
+        signed_msg_class = ret._parse_signed_message_type(data)
+        signed_message = signed_msg_class.parse(data, ret.chip_config)
+        ret.signed_msg_container = signed_message
+
+        return ret
 
     @classmethod
-    def get_family_validation_schemas(cls) -> list[dict[str, Any]]:
-        """Get list of validation schemas for family settings.
-
-        :return: Validation list of schemas.
-        """
-        sch_cfg = get_schema_file("general")["family"]
-        update_validation_schema_family(sch_cfg["properties"], cls.get_supported_families())
-        return [sch_cfg]
-
-    @staticmethod
-    def get_supported_families() -> list[str]:
-        """Get all supported families for AHAB container.
-
-        :return: List of supported families.
-        """
-        return get_families(DatabaseManager.AHAB)
-
-    @classmethod
-    def get_validation_schemas(cls, family: str, revision: str = "latest") -> list[dict[str, Any]]:
+    def get_validation_schemas(cls, family: FamilyRevision) -> list[dict[str, Any]]:
         """Get list of validation schemas.
 
         :param family: Family for which the validation schema should be generated.
-        :param revision: Family revision of chip.
         :return: Validation list of schemas.
         """
-        return cls._get_signed_message_class(
-            family=family, revision=revision
-        ).get_validation_schemas(family=family, revision=revision)
+        return cls._get_signed_message_class(family=family).get_validation_schemas(family=family)
 
     @property
     def srk_count(self) -> int:
@@ -2000,28 +2426,25 @@ class SignedMessage:
         return b""
 
     @classmethod
-    def generate_config_template(
-        cls, family: str, revision: str = "latest", message: Optional[MessageCommands] = None
-    ) -> dict[str, Any]:
-        """Generate AHAB configuration template.
+    def get_config_template(
+        cls, family: FamilyRevision, message: Optional[MessageCommands] = None
+    ) -> str:
+        """Get AHAB configuration template.
 
         :param family: Family for which the template should be generated.
-        :param revision: Family revision of chip.
         :param message: Generate the template just for one message type, if not used , its generated for all messages
         :return: Dictionary of individual templates (key is name of template, value is template itself).
         """
-        val_schemas = cls.get_validation_schemas(family=family, revision=revision)
+        val_schemas = cls.get_validation_schemas(family=family)
         if message:
             for cmd_sch in val_schemas[1]["properties"]["message"]["properties"]["command"][
                 "oneOf"
             ]:
                 cmd_sch["skip_in_template"] = bool(message.label not in cmd_sch["properties"])
 
-        yaml_data = CommentedConfig(
+        return CommentedConfig(
             f"Signed message Configuration template for {family}.", val_schemas
         ).get_template()
-
-        return {f"{family}_signed_msg": yaml_data}
 
     @staticmethod
     def _parse_signed_message_type(
@@ -2029,8 +2452,7 @@ class SignedMessage:
     ) -> Union[Type[SignedMessageContainer], Type[SignedMessageContainerV2]]:
         """Recognize container type from binary data.
 
-        :param family: Family for signed message.
-        :param revision: Family revision of chip.
+        :param data: Data of signed message.
         :raises SPSDKParsingError: In case of invalid data detected.
         :return: Container type
         """
@@ -2045,14 +2467,14 @@ class SignedMessage:
 
     @staticmethod
     def _get_signed_message_class(
-        family: str, revision: str = "latest"
+        family: FamilyRevision,
     ) -> Union[Type[SignedMessageContainer], Type[SignedMessageContainerV2]]:
         """Recognize container type from binary data.
 
         :param data: Binary data
         :return: Container type
         """
-        db = get_db(family, revision)
+        db = get_db(family)
         container_type_2 = bool(2 in db.get_list(DatabaseManager.AHAB, "container_types", []))
         if container_type_2:
             logger.debug("Chosen Signed message PQC version.")

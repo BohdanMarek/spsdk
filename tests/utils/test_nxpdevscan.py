@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2021-2024 NXP
+# Copyright 2021-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -307,6 +307,7 @@ def test_sdio_device_search_no_device_found():
                 "mcxc244",
                 "mcxc443",
                 "mcxc444",
+                "mcxe247",
                 "mimxrt1010",
                 "mimxrt1015",
                 "mimxrt1020",

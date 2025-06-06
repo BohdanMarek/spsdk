@@ -98,21 +98,6 @@ It allows user to:
 
     blhost --help
 
-
-:ref:`ifr`
-================
-
-The *ifr* application allows user to generate IFR0:
-
-- generate user configuration
-- parse binary and extract configuration
-- generate binary data
-- list supported devices
-
-.. code:: bash
-
-    ifr --help
-
 :ref:`nxpcrypto`
 =================
 
@@ -164,6 +149,22 @@ The *nxpdevscan* application allows users to list all connected USB and UART NXP
 
     nxpdevscan --help
 
+:ref:`nxpfuses`
+================
+
+The *nxpfuses* application allows users to:
+
+- write single fuse into device
+- write fuses from configuration into device
+- generate the template of Fuses YAML configuration file
+- generate blhost/nxpele script to burn fuses from configuration
+- save the current state of fuses to config file
+- print the current state of fuses from device
+
+.. code:: bash
+
+    nxpfuses --help
+
 :ref:`nxpimage`
 ===============
 
@@ -200,14 +201,13 @@ The *nxpmemcfg* application allows users to:
 :ref:`pfr`
 ==========
 
-The *pfr* application is a utility for generating and parsing Protected Flash Region data (CMPA, CFPA).
+The *pfr* application is a utility for generating and parsing The protected flash region (called either IFR or PFR) data (CMPA, CFPA, ROMCFG, CMACTABLE).
 
 It allows user to:
 
 - generate user configuration
 - parse binary and extract configuration
 - generate binary data.
-- generate HTML page with brief description of CMPA/CFPA configuration fields
 - list supported devices
 
 .. code:: bash
@@ -272,6 +272,15 @@ The nxpuuu CLI application is designed for image deployment based on the libUUU 
 
     nxpuuu --help
 
+:ref:`nxpshe`
+=================
+
+The nxpshe CLI application is a tool for working with NXP's Secure Hardware Extension (SHE) protocol.
+
+.. code:: bash
+
+    nxpshe --help
+
 -------------------------------
 Deleted/deprecated applications
 -------------------------------
@@ -292,3 +301,20 @@ elftosb
 =========
 
 .. note:: This tool was replaced by :ref:`nxpimage`
+
+
+tpconfig
+========
+
+.. note:: SmartCard Trust Provisioning has been discontinued
+
+
+tphost
+========
+
+.. note:: SmartCard Trust Provisioning has been discontinued
+
+ifr
+========
+
+.. note:: The IFR tool hes been merged to ref:`pfr` tool

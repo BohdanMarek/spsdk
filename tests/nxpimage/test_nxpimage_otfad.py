@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2022-2024 NXP
+# Copyright 2022-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -14,8 +14,9 @@ import pytest
 import yaml
 
 from spsdk.apps import nxpimage
-from spsdk.utils.crypto.otfad import OtfadNxp
+from spsdk.image.otfad.otfad import Otfad
 from spsdk.utils.misc import load_configuration, load_text, use_working_directory
+from spsdk.utils.family import FamilyRevision
 from tests.cli_runner import CliRunner
 
 
@@ -52,7 +53,6 @@ def test_nxpimage_otfad_export(cli_runner: CliRunner, tmpdir, data_dir, config):
                 "efuse-program-once 129 0xBBAA9988 --no-verify",
                 "efuse-program-once 130 0x77665544 --no-verify",
                 "efuse-program-once 131 0x33221100 --no-verify",
-                "efuse-program-once 71 0x20 --no-verify",
             ],
             "otfad_rt1160_out.bin",
             "rt116x",
@@ -118,7 +118,6 @@ def test_nxpimage_otfad_export(cli_runner: CliRunner, tmpdir, data_dir, config):
                 "efuse-program-once 129 0xBBAA9988 --no-verify",
                 "efuse-program-once 130 0x77665544 --no-verify",
                 "efuse-program-once 131 0x33221100 --no-verify",
-                "efuse-program-once 71 0x3 --no-verify",
                 "efuse-program-once 132 0x78563412 --no-verify",
                 "efuse-program-once 133 0x72 --no-verify",
             ],
@@ -149,13 +148,14 @@ def test_nxpimage_otfad_export_rt11x0(
         out_dir = os.path.join(work_dir, config_dict["output_folder"])
         cmd = f"otfad export -i {per_ix} -c {config}"
         cli_runner.invoke(nxpimage.main, cmd.split())
-        assert os.path.isfile(os.path.join(out_dir, f"otfad{per_ix}_{family}.bcf"))
+        new_family = FamilyRevision(family)
+        assert os.path.isfile(os.path.join(out_dir, f"otfad{per_ix}_{new_family.name}.bcf"))
         assert os.path.isfile(os.path.join(out_dir, "encrypted_blobs.bin"))
         assert os.path.isfile(os.path.join(out_dir, "OTFAD_Table.bin"))
         assert os.path.isfile(os.path.join(out_dir, "otfad_whole_image.bin"))
         assert os.path.isfile(os.path.join(out_dir, "readme.txt"))
 
-        blhost_script = load_text(f"otfad{per_ix}_{family}.bcf", search_paths=[out_dir])
+        blhost_script = load_text(f"otfad{per_ix}_{new_family.name}.bcf", search_paths=[out_dir])
 
         for result in blhost_bcf_res:
             assert result in blhost_script
@@ -229,8 +229,8 @@ def test_nxpimage_otfad_kek_cli(cli_runner: CliRunner, tmpdir, data_dir, omk, ok
     ],
 )
 def test_nxpimage_otfad_keys_blhost(omk, ok, family, results):
-    blhost_script = OtfadNxp.get_blhost_script_otp_keys(
-        family, otp_master_key=bytes.fromhex(omk), otfad_kek_seed=bytes.fromhex(ok)
+    blhost_script = Otfad.get_blhost_script_otp_keys(
+        FamilyRevision(family), otp_master_key=bytes.fromhex(omk), otfad_kek_seed=bytes.fromhex(ok)
     )
     assert len(blhost_script)
     for result in results:

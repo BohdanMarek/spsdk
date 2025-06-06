@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2020-2024 NXP
+# Copyright 2020-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 """Module to handle registers descriptions."""
@@ -13,7 +13,9 @@ from typing import Any, Generic, Iterator, Mapping, Optional, Type, TypeVar, Uni
 from typing_extensions import Self
 
 from spsdk.exceptions import SPSDKError, SPSDKValueError
-from spsdk.utils.database import get_db, get_whole_db
+from spsdk.utils.binary_image import BinaryImage, BinaryPattern
+from spsdk.utils.config import Config
+from spsdk.utils.database import get_whole_db
 from spsdk.utils.exceptions import (
     SPSDKRegsError,
     SPSDKRegsErrorBitfieldNotFound,
@@ -21,7 +23,7 @@ from spsdk.utils.exceptions import (
     SPSDKRegsErrorRegisterGroupMishmash,
     SPSDKRegsErrorRegisterNotFound,
 )
-from spsdk.utils.images import BinaryImage, BinaryPattern
+from spsdk.utils.family import FamilyRevision, get_db
 from spsdk.utils.misc import (
     Endianness,
     format_value,
@@ -46,6 +48,7 @@ class Access(SpsdkEnum):
     RO = (1, "RO", "Read-only")
     RW = (2, "RW", "Read/Write")
     WO = (3, "WO", "Write-only")
+    WRITE_CONST = (4, "WRITE_CONST", "Accepts only default value")
 
     @property
     def is_readable(self) -> bool:
@@ -55,7 +58,7 @@ class Access(SpsdkEnum):
     @property
     def is_writable(self) -> bool:
         """Return True if the object is writeable."""
-        return self in [Access.WO, Access.RW]
+        return self in [Access.WO, Access.RW, Access.WRITE_CONST]
 
     @classmethod
     def from_label(cls, label: str) -> Self:
@@ -84,7 +87,7 @@ class RegsEnum:
             self.value = value_to_int(value)
         except (TypeError, ValueError, SPSDKError) as exc:
             raise SPSDKRegsError(f"Invalid Enum Value: {value}") from exc
-        self.description = description or "N/A"
+        self.description = description or ""
         self.max_width = max_width
 
     @classmethod
@@ -273,6 +276,7 @@ class RegsBitField:
         access: Access = Access.RW,
         hidden: bool = False,
         config_processor: Optional[ConfigProcessor] = None,
+        no_yaml_comments: bool = False,
     ) -> None:
         """Constructor of RegsBitField class. Used to store bitfield information.
 
@@ -285,6 +289,7 @@ class RegsBitField:
         :param reset_val: Reset value of bitfield if available.
         :param access: Access type of bitfield.
         :param hidden: The bitfield will be hidden from standard searches.
+        :param no_yaml_comments: Disable yaml comments for this register.
         """
         self.parent = parent
         self.name = name or "N/A"
@@ -298,6 +303,7 @@ class RegsBitField:
         self.config_processor = config_processor or ConfigProcessor()
         self.config_width = self.config_processor.width_update(width)
         self.reset_value = value_to_int(reset_val) if reset_val else self.get_value()
+        self.no_yaml_comments = no_yaml_comments
         if reset_val:
             self.set_value(self.reset_value, raw=True)
 
@@ -321,7 +327,7 @@ class RegsBitField:
         access = Access.from_label(spec.get("access", "RW"))
         reset_value = value_to_int(spec.get("reset_value_int", 0))
         config_processor = ConfigProcessor.from_spec(spec.get("config_preprocess"))
-
+        no_yaml_comments = value_to_bool(spec.get("no_yaml_comments", False))
         bitfield = cls(
             parent,
             name,
@@ -333,6 +339,7 @@ class RegsBitField:
             access,
             hidden,
             config_processor,
+            no_yaml_comments,
         )
 
         for enum_spec in spec.get("values", []):
@@ -540,6 +547,7 @@ class Register:
         base_endianness: Endianness = Endianness.BIG,
         alt_widths: Optional[list[int]] = None,
         hidden: bool = False,
+        no_yaml_comments: bool = False,
     ) -> None:
         """Constructor of RegsRegister class. Used to store register information.
 
@@ -555,9 +563,10 @@ class Register:
         :param base_endianness: Base endianness for bytes import/export of value.
         :param alt_widths: List of alternative widths.
         :param hidden: The register will be hidden from standard searches.
+        :param no_yaml_comments: Disable yaml comments for this register.
         """
         if width % 8 != 0:
-            raise SPSDKValueError("SPSDK Register supports only widths in multiply 8 bits.")
+            raise SPSDKValueError("Register supports only widths in multiply 8 bits.")
         self.name = name
         self.offset = offset
         self.width = width
@@ -574,6 +583,7 @@ class Register:
         self.alt_widths = alt_widths
         self._alias_names: list[str] = []
         self.hidden = hidden
+        self.no_yaml_comments = no_yaml_comments
 
         # Grouped register members
         self.sub_regs: list[Self] = []
@@ -613,6 +623,7 @@ class Register:
         description = spec.get("description", "N/A")
         access = Access.from_label(spec.get("access", "RW"))
         reserved = value_to_bool(spec.get("is_reserved", False))
+        no_yaml_comments = value_to_bool(spec.get("no_yaml_comments", False))
         reg = cls(
             name=name,
             offset=offset,
@@ -622,6 +633,7 @@ class Register:
             reverse=False,
             access=access,
             hidden=reserved,
+            no_yaml_comments=no_yaml_comments,
         )
         reg._reset_value = value_to_int(spec.get("reset_value_int", 0))
         if reg._reset_value:
@@ -721,7 +733,8 @@ class Register:
                 raise SPSDKRegsErrorRegisterGroupMishmash(
                     f"The register {reg.name} has different width."
                 )
-            if self.access != reg.access:
+            # The access validation is skipped for reserved
+            if not reg.hidden and self.access != reg.access:
                 raise SPSDKRegsErrorRegisterGroupMishmash(
                     f"The register {reg.name} has different access type."
                 )
@@ -957,6 +970,14 @@ class Register:
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} {self.name} = {self.get_hex_value()}>"
 
+    @property
+    def has_reset_value(self) -> bool:
+        """Test if the current value is reset value.
+
+        :return: True if the value has not been changed, False otherwise.
+        """
+        return self.get_reset_value() == self.get_value(raw=True)
+
 
 RegisterClassT = TypeVar("RegisterClassT", bound=Register)
 
@@ -972,32 +993,31 @@ class _RegistersBase(Generic[RegisterClassT]):
 
     def __init__(
         self,
-        family: str,
+        family: FamilyRevision,
         feature: str,
         base_key: Optional[Union[list[str], str]] = None,
-        revision: str = "latest",
         base_endianness: Endianness = Endianness.BIG,
         just_standard_library_data: bool = False,
+        do_not_raise_exception: bool = False,
     ) -> None:
         """Initialization of Registers class.
 
-        :param family: Chip family
+        :param family: Family revision object.
         :param feature: Feature name
         :param base_key: Base item key or key path in list like ['grp1', 'grp2', 'key']
-        :param revision: Optional Chip family revision
         :param base_endianness: The base endianness of registers in binary form
         :param just_standard_library_data: The specification is gets from embedded library if True,
             otherwise Restricted data takes in count
+        :param do_not_raise_exception: Enable debug mode - not raising exception in case of error during database load.
         """
         self._registers: list[RegisterClassT] = []
         self.family = family
-        self.revision = revision
         self.base_endianness = base_endianness
         self.feature = feature
         self.base_key = base_key
 
         try:
-            self.db = get_db(device=family, revision=revision)
+            self.db = get_db(family)
             spec_file_name = self.db.get_file_path(
                 self.feature,
                 self._create_key("reg_spec"),
@@ -1008,11 +1028,14 @@ class _RegistersBase(Generic[RegisterClassT]):
             )
             self._load_spec(spec_file=spec_file_name, grouped_regs=grouped_registers)
         except SPSDKError as exc:
-            # Only path for testing and internal tools
-            logger.error(
-                f"Loading of database failed, inform SPSDK team about this error: {str(exc)}"
-                f"\n Family: {family}, Feature: {feature}, Revision: {revision}"
-            )
+            if do_not_raise_exception:
+                # Only path for testing and internal tools
+                logger.info(
+                    f"Loading of database failed, inform SPSDK team about this error: {str(exc)}"
+                    f"\n Family: {self.family}, Feature: {feature}"
+                )
+            else:
+                raise exc
 
     def __iter__(self) -> Iterator[RegisterClassT]:
         """Return an iterator."""
@@ -1171,13 +1194,17 @@ class _RegistersBase(Generic[RegisterClassT]):
         for reg in self.get_registers(exclude):
             reg.reset_value(True)
 
+    def __repr__(self) -> str:
+        """Representation string of that class."""
+        return f"Registers class for {self.family}, feature: {self.feature} "
+
     def __str__(self) -> str:
         """Override 'ToString()' to print register.
 
         :return: Friendly looking string that describes the registers.
         """
         output = ""
-        output += "Device name:        " + self.family + "\n"
+        output += "Device name:        " + str(self.family) + "\n"
         for reg in self._registers:
             output += str(reg) + "\n"
 
@@ -1191,7 +1218,7 @@ class _RegistersBase(Generic[RegisterClassT]):
         :param size: Result size of Image, 0 means automatic minimal size.
         :param pattern: Pattern of gaps, defaults to "zeros"
         """
-        image = BinaryImage(self.family, size=size, pattern=pattern)
+        image = BinaryImage(self.family.name, size=size, pattern=pattern)
         for reg in self._registers:
             description = reg.description
             if reg._alias_names:
@@ -1226,7 +1253,7 @@ class _RegistersBase(Generic[RegisterClassT]):
             logger.info(
                 f"Input binary is smaller than registers supports: {bin_len} != {len(self.image_info())}"
             )
-        for reg in self.get_registers():
+        for reg in self._registers:
             if bin_len < reg.offset + reg.width // 8:
                 logger.debug(f"Parsing of binary block ends at {reg.name}")
                 break
@@ -1278,10 +1305,12 @@ class _RegistersBase(Generic[RegisterClassT]):
             for enum in bitfield.get_enums():
                 descr = enum.description if enum.description != "." else enum.name
                 enum_description = descr
-                description += f"\n- {enum.name}, ({enum.get_value_int()}): {enum_description}"
+                description += f"\n- {enum.name}, ({enum.get_value_int()})"
+                if enum_description:
+                    description += f": {enum_description}"
         return description
 
-    def get_validation_schema(self) -> dict:
+    def get_validation_schema(self) -> dict[str, Any]:
         """Get the JSON SCHEMA for registers.
 
         :return: JSON SCHEMA.
@@ -1289,12 +1318,14 @@ class _RegistersBase(Generic[RegisterClassT]):
         properties: dict[str, Any] = {}
         for reg in self.get_registers():
             bitfields = reg._bitfields
+            bitfields_in_template = len([b for b in bitfields if not b.hidden]) > 0
             reg_schema = [
                 {
                     "type": ["string", "number"],
-                    "skip_in_template": len(bitfields) > 0,
+                    "skip_in_template": bitfields_in_template,
                     # "format": "number", # TODO add option to hexstring
                     "template_value": f"{reg.get_hex_value()}",
+                    "no_yaml_comments": reg.no_yaml_comments,
                 },
                 {  # Obsolete type
                     "type": "object",
@@ -1321,6 +1352,7 @@ class _RegistersBase(Generic[RegisterClassT]):
                             "description": self._get_bitfield_yaml_description(bitfield),
                             "template_value": bitfield.get_value(),
                             "skip_in_template": bitfield.hidden,
+                            "no_yaml_comments": bitfield.no_yaml_comments,
                         }
                     else:
                         bitfields_schema[bitfield.name] = {
@@ -1332,6 +1364,7 @@ class _RegistersBase(Generic[RegisterClassT]):
                             "maximum": (1 << bitfield.width) - 1,
                             "template_value": bitfield.get_enum_value(),
                             "skip_in_template": bitfield.hidden,
+                            "no_yaml_comments": bitfield.no_yaml_comments,
                         }
                 # Extend register schema by obsolete style
                 reg_schema.append(
@@ -1340,6 +1373,7 @@ class _RegistersBase(Generic[RegisterClassT]):
                         "required": ["bitfields"],
                         "skip_in_template": True,
                         "additionalProperties": False,
+                        "no_yaml_comments": reg.no_yaml_comments,
                         "properties": {
                             "bitfields": {"type": "object", "properties": bitfields_schema}
                         },
@@ -1349,20 +1383,26 @@ class _RegistersBase(Generic[RegisterClassT]):
                 reg_schema.append(
                     {
                         "type": "object",
-                        "skip_in_template": False,
+                        "skip_in_template": not bitfields_in_template,
                         "required": [],
                         "additionalProperties": False,
+                        "no_yaml_comments": reg.no_yaml_comments,
                         "properties": bitfields_schema,
                     },
                 )
 
-            properties[reg.name] = {
+            reg_properties = {
                 "title": f"{reg.name}",
                 "description": f"Offset: 0x{reg.offset:08X}, Width: {reg.width}b; {reg.description}",
+                "no_yaml_comments": reg.no_yaml_comments,
                 "oneOf": reg_schema,
             }
+            properties[reg.name] = reg_properties
+            # also register UID is accepted as valid schema key
+            if reg.uid != reg.name:
+                properties[reg.uid] = {**reg_properties, "skip_in_template": True}
 
-        return {"type": "object", "title": self.family, "properties": properties}
+        return {"type": "object", "title": self.family.name, "properties": properties}
 
     @classmethod
     def _get_register_group(
@@ -1413,7 +1453,7 @@ class _RegistersBase(Generic[RegisterClassT]):
         :raises SPSDKError: JSON parse problem occurs.
         """
         try:
-            with open(spec_file, "r") as f:
+            with open(spec_file, "r", encoding="utf-8") as f:
                 spec = json.load(f)
         except json.JSONDecodeError as exc:
             raise SPSDKError(
@@ -1427,7 +1467,7 @@ class _RegistersBase(Generic[RegisterClassT]):
         :param file_name: The name of JSON file that should be created.
         """
         spec: dict[str, Any] = {}
-        spec["cpu"] = self.family
+        spec["cpu"] = self.family.name
 
         regs = []
         for reg in self._registers:
@@ -1437,16 +1477,16 @@ class _RegistersBase(Generic[RegisterClassT]):
 
         write_file(json.dumps(spec, indent=4), file_name)
 
-    def load_yml_config(self, yml_data: dict[str, Any]) -> None:
-        """The function loads the configuration from YML file.
+    def load_from_config(self, config: Config) -> None:
+        """The function loads the registers configuration.
 
         Note: It takes in count the restricted data and different names to standard data
         in embedded database.
 
-        :param yml_data: The YAML commented data with register values.
+        :param config: The configuration data with register values.
         """
         try:
-            self._load_yml_config(yml_data)
+            self._load_from_config(config)
         except (
             SPSDKRegsErrorRegisterNotFound,
             SPSDKRegsErrorBitfieldNotFound,
@@ -1460,33 +1500,31 @@ class _RegistersBase(Generic[RegisterClassT]):
                 family=self.family,
                 feature=self.feature,
                 base_key=self.base_key,
-                revision=self.revision,
                 base_endianness=self.base_endianness,
                 just_standard_library_data=True,
             )
-            std_regs._load_yml_config(yml_data)
+            std_regs._load_from_config(config)
             self.parse(std_regs.export())
             logger.warning(
                 "The input YAML configuration file has been converted from standard"
                 " library names to restricted data library extension."
             )
 
-    def _load_yml_config(self, yml_data: dict[str, Any]) -> None:
+    def _load_from_config(self, config: Config) -> None:
         """The function loads the configuration from YML file.
 
-        :param yml_data: The YAML commented data with register values.
+        :param config: The YAML commented data with register values.
         """
-        if not isinstance(yml_data, dict):
-            raise SPSDKError("The configuration does not contain any register settings.")
-        for reg_name in yml_data.keys():
-            reg_value = yml_data[reg_name]
+        for reg_name in config.keys():
             try:
                 register = self.find_reg(reg_name, include_group_regs=True)
             except SPSDKRegsErrorRegisterNotFound as exc:
                 logger.error(str(exc))
                 raise exc
+            reg_value = config[reg_name]
+
             if isinstance(reg_value, dict):
-                if "value" in reg_value.keys():
+                if "value" in reg_value:
                     raw_val = reg_value["value"]
                     val = (
                         int(raw_val, 16)
@@ -1495,9 +1533,7 @@ class _RegistersBase(Generic[RegisterClassT]):
                     )
                     register.set_value(val, False)
                 else:
-                    bitfields = (
-                        reg_value["bitfields"] if "bitfields" in reg_value.keys() else reg_value
-                    )
+                    bitfields = reg_value["bitfields"] if "bitfields" in reg_value else reg_value
                     for bitfield_name in bitfields:
                         bitfield_val = bitfields[bitfield_name]
                         bitfield = register.find_bitfield(bitfield_name)
@@ -1538,13 +1574,14 @@ class _RegistersBase(Generic[RegisterClassT]):
 
             logger.debug(f"The register {reg_name} has been loaded from configuration.")
 
-    def get_config(self, diff: bool = False) -> dict[str, Any]:
+    def get_config(self, data_path: str = "./", diff: bool = False) -> Config:
         """Get the whole configuration in dictionary.
 
+        :param data_path: Path to store the data files of configuration.
         :param diff: Get only configuration with difference value to reset state.
         :return: Dictionary of registers values.
         """
-        ret: dict[str, Any] = {}
+        ret = Config()
         for reg in self._registers:
             if diff and reg.get_value(raw=True) == reg.get_reset_value():
                 continue
@@ -1562,6 +1599,23 @@ class _RegistersBase(Generic[RegisterClassT]):
                 ret[reg.name] = reg.get_hex_value()
 
         return ret
+
+    @property
+    def has_reset_value(self) -> bool:
+        """Test if the current value is reset value.
+
+        :return: True if the value has not been changed, False otherwise.
+        """
+        return all(x.has_reset_value for x in self._registers)
+
+    @property
+    def size(self) -> int:
+        """Get the size of registers."""
+        if not self._registers:
+            return 0
+
+        last_reg = max(self._registers, key=lambda r: r.offset)
+        return last_reg.offset + last_reg.width // 8
 
 
 class Registers(_RegistersBase[Register]):

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2023-2024 NXP
+# Copyright 2023-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -14,15 +14,18 @@ import math
 import struct
 import time
 from enum import Enum
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from spsdk.el2go.client import EL2GOApiResponse, EL2GOClient, SPSDKHTTPClientError
 from spsdk.el2go.interface import EL2GOInterfaceHandler
 from spsdk.el2go.secure_objects import SecureObjects
 from spsdk.exceptions import SPSDKError, SPSDKUnsupportedOperation
-from spsdk.fuses.fuse_registers import FuseRegister, FuseRegisters
-from spsdk.utils.database import DatabaseManager, get_db, get_families, get_schema_file
+from spsdk.fuses.fuse_registers import FuseRegister
+from spsdk.fuses.fuses import Fuses
+from spsdk.utils.config import Config
+from spsdk.utils.database import DatabaseManager, get_schema_file
 from spsdk.utils.exceptions import SPSDKRegsErrorRegisterNotFound
+from spsdk.utils.family import FamilyRevision, get_db, get_families, update_validation_schema_family
 from spsdk.utils.misc import Timeout, load_binary, value_to_int
 
 logger = logging.getLogger(__name__)
@@ -91,8 +94,7 @@ class EL2GOTPClient(EL2GOClient):
         api_key: str,
         nc12: int,
         device_group_id: int,
-        family: str,
-        revision: str = "latest",
+        family: FamilyRevision,
         url: str = "https://api.edgelock2go.com",
         timeout: int = 60,
         download_timeout: int = 300,
@@ -105,7 +107,6 @@ class EL2GOTPClient(EL2GOClient):
         :param nc12: Product (12NC) number
         :param device_group_id: Device group to work with
         :param family: Target chip family
-        :param revision: Target chip silicon revision, defaults to "latest"
         :param url: EL2GO Server API URL, defaults to "https://api.edgelock2go.com"
         :param timeout: Timeout for each API call, defaults to 60
         :param download_timeout: Timeout for downloading Secure Objects, defaults to 300
@@ -116,9 +117,8 @@ class EL2GOTPClient(EL2GOClient):
         self.delay = delay
         self.download_timeout = download_timeout
         self.family = family
-        self.revision = revision
 
-        self.db = get_db(device=family, revision=revision)
+        self.db = get_db(family=family)
         self.prov_method = ProvisioningMethod(
             self.db.get_str(DatabaseManager.EL2GO_TP, "prov_method")
         )
@@ -127,7 +127,18 @@ class EL2GOTPClient(EL2GOClient):
 
         self.prov_fw_path = kwargs.pop("prov_fw_path")
         self._prov_fw: Optional[bytes] = None
+
         self.uboot_path = kwargs.pop("uboot_path", None)
+        self.fatwrite_filename = kwargs.pop("fatwrite_filename", "secure_objects.bin")
+        self.fatwrite_interface = kwargs.pop("fatwrite_interface", "mmc")
+        self.fatwrite_device_partition = kwargs.pop("fatwrite_device_partition", "0:1")
+        self.oem_provisioning_config_filename = kwargs.pop("oem_provisioning_config_filename", None)
+        self.oem_provisioning_config_bin = b""
+        if self.oem_provisioning_config_filename:
+            self.oem_provisioning_config_bin = load_binary(self.oem_provisioning_config_filename)
+
+        self.boot_linux = kwargs.pop("boot_linux", False)
+        self.linux_boot_sequence: list = kwargs.pop("linux_boot_sequence", [])  # type: ignore
 
         self.tp_data_address = value_to_int(kwargs.pop("secure_objects_address"))
         self.clean_method = CleanMethod(self.db.get_str(DatabaseManager.EL2GO_TP, "clean_method"))
@@ -170,32 +181,33 @@ class EL2GOTPClient(EL2GOClient):
     ) -> None:
         """Assign a device to the configured group."""
         response, url = self._assign_device_to_group(device_id=device_id)
-        if response.status_code == 422:
-            # 'code' is not present in all responses
-            if response.json_body["code"] == "ERR_SEDM_422_1":  # cspell:ignore SEDM
-                logger.warning(response.json_body["details"])
-                try:
-                    # first check if the existing registration is the current group
-                    self._find_device_group_id(device_id=device_id, group_id=self.device_group_id)
-                    logger.warning("Device is already registered in the desired Device Group")
-                except SPSDKError:
-                    if not allow_reassignment:
-                        raise
-                    logger.warning(
-                        "Device is already registered in a different Device Group. Attempting re-assignment."
-                    )
-                    # searching for group containing the device
-                    # failure to find the device will throw an exception, thus no checking is done here
-                    device_group = self._find_device_group_id(device_id=device_id)
-                    logger.info(f"Device {device_id} found in group {device_group}")
+        if response.status_code == 422 and response.json_body["code"] == "ERR_SEDM_422_11":
+            details: dict = json.loads(response.json_body["details"])
+            logger.warning(json.dumps(details, indent=2))
 
-                    response, url = self._unassign_device_from_group(
-                        device_id=device_id, group_id=device_group
-                    )
+            if device_id in details["notFoundDevices"]:
+                # device ID was not found, raise an exception
+                self.response_handling(response, url)
+
+            diff_group: list[dict[str, str]] = details.get("devicesInDifferentGroup", [])
+            diff_group_dict = {str(int(i["deviceId"], 16)): i["deviceGroupId"] for i in diff_group}
+
+            if device_id in diff_group_dict:
+                device_group = diff_group_dict[device_id]
+                logger.info(f"Device {device_id} found in group {device_group}")
+
+                # device ID was found in different group, but re-assignment id disabled
+                if not allow_reassignment:
                     self.response_handling(response, url)
-                    response, url = self._assign_device_to_group(device_id=device_id)
-                    self.response_handling(response, url)
-                return
+
+                response, url = self._unassign_device_from_group(
+                    device_id=device_id, group_id=device_group
+                )
+                self.response_handling(response, url)
+                response, url = self._assign_device_to_group(device_id=device_id)
+
+            self.response_handling(response, url)
+
         self.response_handling(response, url)
 
     def get_generation_status(self, device_id: str) -> str:
@@ -205,12 +217,12 @@ class EL2GOTPClient(EL2GOClient):
             "hardware-family-type": [self.hardware_family_type],
             "owner-domain-types": self.domains,
         }
+
         response = self._handle_el2go_request(method=self.Method.GET, url=url, param_data=data)
         self.response_handling(response=response, url=url)
         if not response.json_body["content"]:
-            raise SPSDKError(
-                f"No Secure Objects found for device {device_id} using domain(s): {', '.join(self.domains)}"
-            )
+            return WAIT_STATES[0]
+
         for provisioning in response.json_body["content"]:
             # fail early if generation failed
             if provisioning["provisioningState"] in BAD_STATES:
@@ -280,7 +292,11 @@ class EL2GOTPClient(EL2GOClient):
         return data
 
     def serialize_provisionings(self, provisionings: dict) -> bytes:
-        """Serialize Secure Objects from JSON object to bytes."""
+        """Serialize Secure Objects from JSON object to bytes.
+
+        :param provisionings: Dictionary containing provisioning information
+        :return: Serialized bytes of provisioning data
+        """
         data = bytes()
         for dev_prov in provisionings:
             data += self._serialize_single_provisioning(dev_prov)
@@ -389,14 +405,58 @@ class EL2GOTPClient(EL2GOClient):
         response = self.get_test_connection_response()
         self.response_handling(response, url)
 
-    def register_devices(self, uuids: list[str]) -> str:
-        """Register job for UUIDs."""
+    def register_devices(
+        self, uuids: list[str], remove_errors: bool = False
+    ) -> tuple[Optional[str], Optional[int]]:
+        """Register job for UUIDs.
+
+        :param uuids: List of UUIDs to submit into registration job
+        :param remove_errors: Attempt to remove erroneous UUIDs, defaults to False
+        :raises SPSDKHTTPClientError: In case of an erroneous response (response code >= 400)
+        :return: Tuple of Job ID and Job size. None indicates that no UUIDs were left after removing the erroneous ones
+        """
         logger.info(f"Submitting job for {len(uuids)} devices")
         url = f"/api/v1/products/{self.nc12}/device-groups/{self.device_group_id}/register-devices"
         data = {"deviceIds": uuids}
         response = self._handle_el2go_request(self.Method.POST, url=url, json_data=data)
-        self.response_handling(response, url)
-        return response.json_body["jobId"]
+        try:
+            self.response_handling(response, url)
+        except SPSDKHTTPClientError as e:
+            if not remove_errors:
+                raise
+            if e.status_code != 422:
+                raise
+            details: dict = (
+                e.response["details"]
+                if isinstance(e.response["details"], dict)
+                else json.loads(e.response["details"])
+            )
+            uuids_to_exclude: list[str] = []
+
+            not_found: list[str] = details["notFoundDevices"]
+            if not_found:
+                not_found = [str(int(uuid, 16)) for uuid in not_found]
+                logger.error(f"Following {len(not_found)} UUID(s) not found")
+                for nf_uuid in not_found:
+                    logger.error(nf_uuid)
+                    uuids_to_exclude.append(nf_uuid)
+
+            diff_group: list[dict] = details["devicesInDifferentGroup"]
+            if diff_group:
+                logger.error(
+                    f"Following {len(diff_group)} UUID(s) already registered in different group(s)"
+                )
+                for record in diff_group:
+                    logger.error(f"{record['deviceId']} in group: {record['deviceGroupId']}")
+                    uuids_to_exclude.append(str(int(record["deviceId"], 16)))
+
+            for to_exclude in uuids_to_exclude:
+                logger.info(f"Removing {to_exclude} from list of UUIDs to register")
+                uuids.remove(to_exclude)
+            if uuids:
+                return self.register_devices(uuids=uuids, remove_errors=False)
+            return None, None
+        return response.json_body["jobId"], len(uuids)
 
     def get_job_details(self, job_id: str) -> Optional[dict]:
         """Get job details."""
@@ -491,8 +551,8 @@ class EL2GOTPClient(EL2GOClient):
             # don't use top-level import to save time in production, where this functionality is not required
             from spsdk.pfr.pfr import CMPA
 
-            cmpa = CMPA(family=self.family, revision=self.revision)
-            cmpa.set_config({})
+            cmpa = CMPA(family=self.family)
+            cmpa.set_config(Config())
             cmpa_data = cmpa.export(draw=False)
             cmpa_address = self.db.get_int(DatabaseManager.PFR, ["cmpa", "address"])
 
@@ -502,13 +562,15 @@ class EL2GOTPClient(EL2GOClient):
         raise SPSDKUnsupportedOperation(f"Unsupported cleanup method {self.clean_method}")
 
     @classmethod
-    # type: ignore[override]
-    # pylint: disable=arguments-differ
-    def get_validation_schema(cls, family: str, revision: str = "latest") -> dict:
+    def get_validation_schemas(cls, family: FamilyRevision) -> list[dict[str, Any]]:  # type: ignore[override]  # pylint: disable=arguments-differ
         """Get JSON schema for validating configuration data."""
         schema_file = get_schema_file(DatabaseManager.EL2GO_TP)
+        schema_family = get_schema_file("general")["family"]
+        update_validation_schema_family(
+            sch=schema_family["properties"], devices=cls.get_supported_families(), family=family
+        )
         schema = schema_file["el2go_tp"]
-        db = get_db(device=family, revision=revision)
+        db = get_db(family=family)
 
         # fw_load_address = db.get_int(DatabaseManager.EL2GO_TP, "fw_load_address")
         # if fw_load_address > 0:
@@ -526,27 +588,27 @@ class EL2GOTPClient(EL2GOClient):
             schema["required"].extend(schema_file["secure_objects_address"]["required"])
         if use_uboot:
             schema["properties"].update(schema_file["uboot_path"]["properties"])
+            schema["properties"].update(schema_file["fatwrite"]["properties"])
+            schema["properties"].update(schema_file["linux_boot"]["properties"])
         else:
             schema["properties"].update(schema_file["prov_fw_path"]["properties"])
             schema["required"].extend(schema_file["prov_fw_path"]["required"])
 
-        return schema
+        return [schema_family, schema]
 
     @classmethod
-    def get_supported_families(cls) -> list[str]:
+    def get_supported_families(cls) -> list[FamilyRevision]:
         """Get family names supported by WPCTarget."""
         return get_families(DatabaseManager.EL2GO_TP)
 
     @classmethod
-    # type: ignore[override]
-    # pylint: disable=arguments-differ
-    def generate_config_template(cls, family: str, revision: str = "latest") -> str:
+    def get_config_template(cls, family: FamilyRevision) -> str:  # type: ignore[override]  # pylint: disable=arguments-differ
         """Generate configuration YAML template for given family."""
-        schema = cls.get_validation_schema(family=family, revision=revision)
-        schema["properties"]["family"]["template_value"] = family
-        schema["properties"]["revision"]["template_value"] = revision
-        return super().generate_config_template(
-            schemas=[schema],
+        schema = cls.get_validation_schemas(family=family)
+
+        return super().get_config_template(
+            family,
+            schemas=schema,
             title=f"Configuration of EdgeLock 2GO Offline Provisioning flow for {family}",
         )
 
@@ -557,52 +619,27 @@ def split_user_data(data: bytes) -> tuple[bytes, bytes]:
     return internal, external
 
 
-def get_el2go_otp_binary(config_data: Union[list, dict], family: Optional[str] = None) -> bytes:
+def get_el2go_otp_binary(config: Config) -> bytes:
     """Create EL2GO OTP Binary from the user config data."""
-    if isinstance(config_data, list):
-        if not family:
-            raise SPSDKError("When using SEC Tool's JSON config, you need to specify family.")
-    elif isinstance(config_data, dict):
-        # schema validation goes here
-        family = config_data["family"]
+    defaults = Fuses.load_from_config(config)
 
-    user_regs: list[FuseRegister] = []
-    assert isinstance(family, str)
-    defaults = FuseRegisters(family=family)
-
-    if isinstance(config_data, list):
-        # SEC Tool's config file
-        page_info: dict = config_data.pop(0)
-        page_type = page_info.get("page_type")
-        if page_type != "OTP":
-            raise SPSDKError("Invalid config file format. Missing OTP page_type.")
-        user_data: dict = config_data.pop(0)
-        for user_reg_name, user_reg_value in user_data.items():
-            try:
-                reg = defaults.find_reg(name=user_reg_name)
-            except SPSDKRegsErrorRegisterNotFound:
-                logger.warning(f"Register {user_reg_name} was not found")
-                continue
-            if isinstance(user_reg_value, (str, int)):
-                reg.set_value(user_reg_value)
-            if isinstance(user_reg_value, dict):
-                for bf_name, bf_value in user_reg_value.items():
-                    bf = reg.find_bitfield(bf_name)
-                    bf.set_value(bf_value)
-            user_regs.append(reg)
-
-    else:
-        raise SPSDKUnsupportedOperation(
-            "Support for dedicated SPSDK config file is not yet implemented"
-        )
-
-    if not user_regs:
+    selected_register_names: list[str] = list(config.get_dict("registers").keys())
+    if not selected_register_names:
         raise SPSDKError("No OTP fuses were decoded from the user configuration.")
+    logger.info(f"Selected registers {selected_register_names}")
+
+    selected_registers: list[FuseRegister] = []
+    for reg_name in selected_register_names:
+        try:
+            reg = defaults.fuse_regs.find_reg(name=reg_name, include_group_regs=True)
+            selected_registers.append(reg)
+        except SPSDKRegsErrorRegisterNotFound as e:
+            raise SPSDKError(f"Invalid fuse name found in user configuration: {reg_name}") from e
 
     data = bytes()
-    ignored = _get_ignored_otp_indexes(family=family)
-    for user_reg in user_regs:
-        if user_reg.otp_index in ignored:
+    ignored = _get_ignored_otp_indexes(family=defaults.family)
+    for user_reg in selected_registers:
+        if _should_ignore_register(reg=user_reg, ignore_list=ignored):
             logger.info(f"Ignoring OTP: {user_reg.uid} ({user_reg.name})")
             continue
 
@@ -619,10 +656,10 @@ def get_el2go_otp_binary(config_data: Union[list, dict], family: Optional[str] =
     return data
 
 
-def _get_ignored_otp_indexes(family: str) -> list[int]:
+def _get_ignored_otp_indexes(family: FamilyRevision) -> list[int]:
     """Get all list of indexes of OTPs that should be ignored."""
     result: list[int] = []
-    db = get_db(device=family)
+    db = get_db(family=family)
     ignored_otp = db.get_list(DatabaseManager.EL2GO_TP, "ignored_otp", default=[])
     ignored_otp_ranges = db.get_list(DatabaseManager.EL2GO_TP, "ignored_otp_ranges", default=[])
     for idx in ignored_otp:
@@ -632,3 +669,12 @@ def _get_ignored_otp_indexes(family: str) -> list[int]:
         for idx in range(start, end + 1):
             result.append(idx)
     return result
+
+
+def _should_ignore_register(reg: FuseRegister, ignore_list: list[int]) -> bool:
+    if reg.otp_index and reg.otp_index in ignore_list:
+        return True
+    if reg.has_group_registers():
+        if any(sub.otp_index in ignore_list for sub in reg.sub_regs):
+            return True
+    return False

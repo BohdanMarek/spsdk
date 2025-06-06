@@ -1,4 +1,4 @@
-# Copyright 2023-2024 NXP
+# Copyright 2023-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -100,11 +100,13 @@ features:
 
   # ======== AHAB section ========
   ahab:
+    sub_features: [ahab_image]
     containers_max_cnt: 2
     oem_images_max_cnt: 8
     valid_offset_minimal_alignment: 4
     container_image_size_alignment: 512 # To satisfy SD card blocks
     container_types: [1] # Supported container types
+    iae_has_signed_offsets: False # There is a special cases when the Container is after images
     core_ids: {}
     image_types: {}
     image_types_mapping: {}
@@ -140,10 +142,6 @@ features:
     cmpa:
       erase_method: write_memory
 
-  # ======== IFR section ========
-  ifr:
-    sub_features: [romcfg, cmactable]
-
   # ======== Bootable image section ========
   bootable_image:
     mem_types: {}
@@ -155,7 +153,7 @@ features:
   # ======== XMCD section ========
   xmcd:
     header:
-      reg_spec: ../../common/xmcd/header.json
+      reg_spec: ../../common/xmcd/flexspi_ram_header.json
     mem_types: {}
     fuses: {}
 
@@ -184,6 +182,7 @@ features:
     additional_template: []
     additional_template_text: ""
     supports_key_scrambling: False
+    reversed_scramble_key: False
 
   # ======== Secure binary v2.1 section ========
   sb21:
@@ -194,9 +193,22 @@ features:
   sb31:
     supported_commands: []
     key_wraps_version: 1
+    variable_block_length: false
+    commands_block_length: 256
+    supports_compression: false
 
   # ======== Secure binary vX section ========
-  sbx: {}
+  sbx:
+    commands_block_length: 256
+    variable_block_length: false
+    supported_commands: []
+
+  # ======== Secure binary c section ========
+  sbc:
+    commands_block_length: 256
+    key_wraps_version: 2
+    variable_block_length: false
+    supported_commands: []
 
   # ======== Shadow registers section ========
   shadow_regs:
@@ -206,6 +218,7 @@ features:
 
   # ======== Device Hardware Security Module (HSM) section ========
   devhsm:
+    sub_features: [DevHsm]
     supported_commands:
       - erase
       - load
@@ -219,24 +232,10 @@ features:
     flag: 0x1
     key_blob_offset: 0x4
     key_blob_command_position: -1
-    devhsm_class: DevHsm
-
-  # ======== Trust provisioning section ========
-  tp:
-    erase_memory: false
-    need_tp_fw: true
-    need_cfpa_update: true
-    need_revoke_update: true
-    version_offset: 0x4
-    revoke_offset: 0x18
-    max_oem_cert_size: 1000
-    use_prov_data: false
-    key_flags_version: 0
-    die_id_cert_version: 0
 
   # ======== Trust Zone section ========
   tz:
-    reg_spec: tz.yaml
+    reg_spec: tz.json
 
   # ======== EdgeLock Enclave section ========
   ele:
@@ -255,12 +254,12 @@ features:
         interfaces: [octal_spi, quad_spi, hyper_flash]
         instances: []
       xspi_nor:
-        reg_spec: ../../common/memcfg/opt_word_flexspi_nor.json
+        reg_spec: ../../common/memcfg/opt_word_xspi_nor.json
         region_number: 0x0b
         ow_counts_rule: OptionSize
         runtime_instance: True
         mem_type: nor
-        interfaces: [octal_spi, quad_spi, hyper_flash]
+        interfaces: [octal_spi, quad_spi]
         instances: []
       flexspi_nand:
         reg_spec: ../../common/memcfg/opt_word_flexspi_nand.json
@@ -351,6 +350,7 @@ features:
     # format: "method1=value1[,value2];method2=value3;..." or "none" (default)
     # methods are in secure_object.py:ValidationMethod
     validation_method: "none"
+    uuid_fuse_index: "6 0 4"
 
   # ======== LPCPROG section ========
   lpcprog:
@@ -417,3 +417,14 @@ features:
       spl:
         script: ../../common/uuu/spl_boot.lst
         arguments: [_flash.bin]
+
+  # ======== BCA section ========
+  bca:
+    reg_spec: bca.json
+
+  # ======== FCF section ========
+  fcf:
+    reg_spec: fcf.json
+
+  # ======== SHE section ========
+  she_scec: {}
