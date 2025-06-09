@@ -30,6 +30,7 @@ def calculate_rtf(family: FamilyRevision, mbi_data: bytes) -> Optional[bytes]:
     data_hash = get_hash(puk, data_hash_alg)
     rtf = get_hash(rtf + data_hash, rtf_hash_alg)
 
+    #TEST TEST
     rkth = mbi.cert_block.root_key_record._rkht.export()
     data_hash = get_hash(rkth, data_hash_alg)
     rtf = get_hash(rtf + data_hash, rtf_hash_alg)
