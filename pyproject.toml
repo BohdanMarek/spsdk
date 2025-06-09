@@ -267,5 +267,8 @@ project_name = "spsdk"
 include_detector_types = ["pip"]
 sbom_location = "SBOM-spsdk.spdx.json"
 
+[tool.release-tools.github]
+repo_name = "BohdanMarek/spsdk"
+
 [tool.check-wheel-contents]
 ignore = "W002" # Wheel contains duplicate files

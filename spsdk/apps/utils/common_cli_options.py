@@ -579,7 +579,7 @@ def spsdk_config_option(
             cfg.search_paths = [cfg_dir]
             cfg.config_dir = cfg_dir
             for oc in override_config:
-                pair = oc.split("=", 1)
+                pair = oc.split("=")
                 cfg[pair[0]] = pair[1]
 
             if klass:
